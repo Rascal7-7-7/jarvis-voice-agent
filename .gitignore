@@ -5,6 +5,7 @@
 # ─────────────────────────────────────────────────────────────
 /*
 !/.gitignore
+!/.github/
 !/README.md
 !/deploy/
 !/hermes-jarvis/

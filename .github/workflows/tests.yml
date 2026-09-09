@@ -1,0 +1,72 @@
+# JARVIS のハードウェア非依存テストを push / PR ごとに走らせる。
+#
+# なぜ必要か:
+#   2026-09-09 の一日で実装バグを 16 件踏み、原因帰属を 4 回誤った。
+#   ローカルでは通していたが、通し忘れれば壊れたまま push できる状態だった。
+#   239 件のテストがあるのに自動実行が無いのは、書いたテストを活かしていない。
+#
+# 対象の選び方:
+#   実行するのは**マイクを必要としないスイート**だけ。
+#   test_shared_audio.py の 7 件は production runtime が wake lease を
+#   保持しているため実機でも実行できない（WakeWordInUse）。CI でも同じなので外す。
+#   test_startup_warm / test_renew_policy は Ollama を叩くので外す。
+#
+#   選んだスイートはすべて**標準ライブラリのみ**で動く（実測で確認）。
+#   numpy も sounddevice も要らないので、依存インストールが無く速い。
+
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: pytest を入れる（他の依存は不要）
+        run: python -m pip install --quiet pytest
+
+      - name: ハードウェア非依存スイート
+        working-directory: hermes-jarvis/tests
+        run: |
+          python -m pytest -q \
+            test_audio_devices.py \
+            test_audio_output.py \
+            test_jarvis_speech.py \
+            test_jarvis_secretary.py \
+            test_jarvis_status.py \
+            test_noise_floor.py \
+            test_replacement_counter.py
+
+      - name: 設定ファイルが壊れていないか
+        run: |
+          python -c "import json; json.load(open('hermes-jarvis/config/known_gaps.json')); print('known_gaps.json OK')"
+
+      - name: production source の構文チェック
+        run: |
+          python - <<'PY'
+          import ast, pathlib, sys
+          bad = []
+          for p in list(pathlib.Path('hermes-jarvis/bin').glob('*.py')) + \
+                   list(pathlib.Path('hermes-jarvis/tools').glob('*.py')) + \
+                   list(pathlib.Path('jarvis-watchdog').rglob('*.py')):
+              # .pre-* / .post-* は退避コピーなので対象外
+              if any(s in p.name for s in ('.pre-', '.post-')):
+                  continue
+              try:
+                  ast.parse(p.read_text(encoding='utf-8', errors='replace'))
+              except SyntaxError as e:
+                  bad.append(f'{p}: {e}')
+          for b in bad:
+              print('SYNTAX ERROR', b, file=sys.stderr)
+          sys.exit(1 if bad else 0)
+          PY
