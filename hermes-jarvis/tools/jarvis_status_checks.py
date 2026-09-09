@@ -270,6 +270,90 @@ def evaluate_shared_stream(counters: Mapping[str, Any] | None) -> Check:
     return Check("Audio", OK, summary, data)
 
 
+# ----------------------------------------------------------- capture health
+#
+# 2026-09-08/09 の実測で3つの失敗モードを踏んだ。いずれも既にログには出ていたが
+# status/HUD に出ていなかったため、利用者からは「待つが返答がない」「少し長い」
+# としか見えず、切り分けに数時間かかった。ここで可視化する。
+#
+#   digital silence  PEAK_RMS=0             クラムシェルで内蔵マイクが無音を返す
+#   clipping         PEAK_RMS>=CLIP         入力音量が高すぎ、無音検出が発火しない
+#   capture cap      silence_cb_fired=False 上限まで走り 1 ターン +26s
+#
+# int16 の上限は 32767。飽和判定はその手前に置く。
+_CLIP_THRESHOLD = 32000
+
+_CAPTURE_RE = re.compile(
+    r"capture TURN=(\d+) silence_cb_fired=(True|False) "
+    r"FRAMES=(\d+) PEAK_RMS=(\d+)")
+
+
+def parse_captures(lines: Sequence[str]) -> list[dict[str, Any]]:
+    """Capture 行を古い順に構造化する。壊れた行は黙って捨てる。"""
+    out: list[dict[str, Any]] = []
+    for line in lines:
+        m = _CAPTURE_RE.search(line)
+        if not m:
+            continue
+        out.append({"turn": int(m.group(1)),
+                    "silence_cb_fired": m.group(2) == "True",
+                    "frames": int(m.group(3)),
+                    "peak_rms": int(m.group(4))})
+    return out
+
+
+def evaluate_capture_health(lines: Sequence[str]) -> Check:
+    """直近の capture が実際に音を拾えているか。
+
+    判定は**最後の capture** に対して行う。過去に無音があっても現在正常なら
+    OK にしないと、一度きりの事故で永久に WARN が残る。ただし無音が連続して
+    いる場合はその本数を出す（クラムシェルのように状態が持続する故障は
+    1 本より N 本の方が状況を語る）。
+    """
+    caps = parse_captures(lines)
+    if not caps:
+        return Check("Capture", OK, "まだ capture がありません",
+                     {"available": False})
+
+    last = caps[-1]
+    rms = last["peak_rms"]
+    fired = last["silence_cb_fired"]
+
+    streak = 0
+    for cap in reversed(caps):
+        if cap["peak_rms"] == 0:
+            streak += 1
+        else:
+            break
+
+    data = {"available": True, "turn": last["turn"], "peak_rms": rms,
+            "frames": last["frames"], "silence_cb_fired": fired,
+            "silent_streak": streak}
+
+    if rms == 0:
+        detail = f"PEAK_RMS=0 — マイクが無音です"
+        if streak > 1:
+            detail += f"（{streak}ターン連続）"
+        detail += "。既定入力デバイスを確認し、runtime を再起動してください"
+        return Check("Capture", WARN, detail, data)
+
+    if rms >= _CLIP_THRESHOLD:
+        return Check("Capture", WARN,
+                     f"PEAK_RMS={rms} — 入力がクリッピングしています。"
+                     "入力音量を下げてください（無音検出が発火せず capture が上限まで走ります）",
+                     data)
+
+    if not fired:
+        return Check("Capture", WARN,
+                     f"silence_cb_fired=False / FRAMES={last['frames']} — "
+                     "無音検出が発火せず capture が上限まで走りました",
+                     data)
+
+    return Check("Capture", OK,
+                 f"PEAK_RMS={rms} / FRAMES={last['frames']} / TURN={last['turn']}",
+                 data)
+
+
 # ------------------------------------------------------------- startup warm
 _WARM_OK_RE = re.compile(r"ollama warm \(startup\): (\S+) ready in ([\d.]+)s")
 _WARM_FAIL_RE = re.compile(r"ollama warm \(startup\) failed: (\w+)")

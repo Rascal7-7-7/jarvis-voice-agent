@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from jarvis_status_checks import (  # noqa: E402
     FAIL, HEALTHY, INFO, OK, WARN, Check, current_generation, evaluate_hermes,
     evaluate_login_item, evaluate_ollama, evaluate_permission, evaluate_process,
-    evaluate_shared_stream, evaluate_startup_warm, evaluate_state,
+    evaluate_capture_health, evaluate_shared_stream, evaluate_startup_warm, evaluate_state,
     evaluate_wake_lease, evaluate_watchdog, extract_counters, load_gaps,
     match_process, overall_status,
 )
@@ -246,6 +246,7 @@ def collect() -> tuple[list[Check], list[dict[str, Any]]]:
 
     generation = current_generation(_read_tail(RUNTIME_LOG, LOG_TAIL_BYTES))
     checks.append(evaluate_shared_stream(extract_counters(generation)))
+    checks.append(evaluate_capture_health(generation))
     checks.append(evaluate_startup_warm(generation))
 
     tags_status, tags = _http_get(f"{OLLAMA_URL}/api/tags")

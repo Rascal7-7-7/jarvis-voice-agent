@@ -492,3 +492,74 @@ def test_health_check_finishes_quickly():
                    capture_output=True, text=True, timeout=60)
     elapsed = time.monotonic() - t
     assert elapsed < 10.0, f"health check took {elapsed:.1f}s"
+
+
+# ---------------------------------------------------------------- capture health
+#
+# 2026-09-08/09 の実測で判明した3つの失敗モードを status に出す。
+# いずれも既にログには出ていたが可視化されておらず、利用者からは
+# 「待つが返答がない」「少し長い」としか見えず切り分けに数時間を要した。
+#
+#   1. digital silence   PEAK_RMS=0            クラムシェルで内蔵マイクが無音
+#   2. clipping          PEAK_RMS>=32000       入力音量が高すぎて無音検出が発火しない
+#   3. capture cap       silence_cb_fired=False 上限まで走り毎ターン +26s
+
+def _cap(turn, fired, frames, rms):
+    return (f"2026-09-09 12:00:0{turn} INFO jarvis: capture TURN={turn} "
+            f"silence_cb_fired={fired} FRAMES={frames} PEAK_RMS={rms} wav=True "
+            "{'PA_OPEN_COUNT': 1, 'PA_START_COUNT': 1}")
+
+
+def test_capture_health_no_capture_yet_is_ok():
+    chk = c.evaluate_capture_health(["2026-09-09 12:00:00 INFO jarvis: state=IDLE"])
+    assert chk.status == c.OK
+    assert chk.data["available"] is False
+
+
+def test_capture_health_normal_turn_is_ok():
+    chk = c.evaluate_capture_health([_cap(1, "True", 345, 20502)])
+    assert chk.status == c.OK
+    assert chk.data["peak_rms"] == 20502
+
+
+def test_capture_health_digital_silence_is_warned():
+    chk = c.evaluate_capture_health([_cap(1, "True", 751, 0)])
+    assert chk.status == c.WARN
+    assert "無音" in chk.detail
+    assert chk.data["peak_rms"] == 0
+
+
+def test_capture_health_counts_consecutive_silent_captures():
+    lines = [_cap(1, "True", 751, 0), _cap(2, "True", 751, 0), _cap(3, "True", 751, 0)]
+    chk = c.evaluate_capture_health(lines)
+    assert chk.status == c.WARN
+    assert chk.data["silent_streak"] == 3
+
+
+def test_capture_health_clipping_is_warned():
+    chk = c.evaluate_capture_health([_cap(1, "False", 2813, 32768)])
+    assert chk.status == c.WARN
+    assert "クリッピング" in chk.detail
+
+
+def test_capture_health_cap_without_clipping_is_warned():
+    # 無音検出が発火せず上限まで走ったが、レベルは飽和していない場合
+    chk = c.evaluate_capture_health([_cap(1, "False", 2813, 5000)])
+    assert chk.status == c.WARN
+    assert chk.data["silence_cb_fired"] is False
+
+
+def test_capture_health_uses_the_most_recent_capture():
+    lines = [_cap(1, "True", 751, 0), _cap(2, "True", 345, 18000)]
+    chk = c.evaluate_capture_health(lines)
+    assert chk.status == c.OK
+    assert chk.data["peak_rms"] == 18000
+    assert chk.data["silent_streak"] == 0
+
+
+def test_capture_health_ignores_malformed_capture_lines():
+    lines = ["2026-09-09 12:00:00 INFO jarvis: capture TURN=x PEAK_RMS=oops",
+             _cap(2, "True", 345, 12000)]
+    chk = c.evaluate_capture_health(lines)
+    assert chk.status == c.OK
+    assert chk.data["peak_rms"] == 12000
