@@ -266,3 +266,74 @@ JARVIS の委譲は `--permission-mode plan` / `--sandbox read-only` が argv �
    これは番兵値なので「999日放置」と読み上げるのは事実と違う。日数のあるものと分けた
 
 tests: `test_jarvis_secretary.py` 19件（新規）。
+
+---
+
+## 変更6: 読み上げ前のサニタイズ（所見#10）と Output チェック
+
+### 問題1: ツール呼び出しの生 JSON を 33 秒間読み上げた
+2026-09-09 17:26 実測:
+```
+state=SPEAKING clarify{questions:[{choices:[<|"|>症状の詳細を教えてください<|"|>,…
+PLAYBACK_DURATION=32992ms
+
+state=SPEAKING clarify{questions:[{choices:[<|"|>はい<|"|>,<|"|>いいえ<|"|>],que…
+PLAYBACK_DURATION=23421ms
+```
+
+原因は2段:
+1. `jarvis-dispatch` の `LOCAL_TOOL|WEB|LOCAL` 分岐は **C8（読み上げ整形）を通らない**。
+   C8 は `esac` の後にあり、`CODEX` / `CLAUDE` のフォールスルーにしか適用されない。
+   よって hermes の戻り値がそのまま TTS に渡る。
+2. `<|"|>` は hermes の Python ソースに**存在しない**。つまり gemma4:e2b が
+   **テキスト形式の壊れたツール呼び出しを出力**し、hermes がそれを回答として返した。
+
+handoff §7 は「production で表示しないもの: heard_text / expanded response /
+raw tool args」と規定している。**読み上げも同じ扱いにすべき**だった。
+
+音が出ていなかったので今まで無害だったが、出力を直すと顕在化する（実際に顕在化した）。
+
+### 対策: bin/jarvis_speech.py
+読み上げ直前に決定的なサニタイズを行う（モデルを使わない）。
+
+- モデル特殊トークン `<|…|>`、`name{…}` 形、`questions:[` / `choices:[` を検出
+- clarify の場合は `question` フィールド、無ければ最初の引用文字列を取り出す
+- 取り出せなければ短い定型文に落とす
+- **形に関係なく読み上げ長の上限（180 文字）を適用する**。
+  パターンの網羅ではなく上限で止めるのが確実。33 秒読み上げを二度と起こさない
+
+実測での効果:
+```
+110字 clarify{...}  → 「どちらについて聞きたいですか」(14字)   19秒 → 2秒
+ 84字 clarify{...}  → 「続けますか」(5字)                      14秒 → 1秒
+ 24字 通常の応答     → 素通し（変更なし）
+ 44字 秘書の応答     → 素通し（変更なし）
+```
+
+配線先は `LOCAL_TOOL|WEB|LOCAL` 分岐と C8 の両方。全経路で上限が効く。
+
+### 問題2: 出力先が分からず「音が出ない」の切り分けに時間がかかった
+TTS は mp3 を生成し `PLAYBACK_DURATION` も記録されるのに音が出なかった。
+既定出力が DisplayLink ドック（`Realtek USB2.0 Audio`）で、そこに何も繋がって
+いなかったため。**JARVIS は「再生した」しか知らず、出力先を知る手段が無かった。**
+
+### 対策: jarvis-status の Output チェック
+```
+Output ✓ MacBook Proのスピーカー / 音量 100
+Output ! MacBook Proのスピーカー / ミュート中です
+Output ! MacBook Proのスピーカー / 音量が 0 です
+Output ! Realtek USB2.0 Audio — 機器が接続されていないと無音になります。
+         音が聞こえない場合は出力先を確認してください
+```
+ドック/HDMI/USB は「繋がっていなければ無音」になりやすいので注記する（断定はしない。
+ドックにスピーカーを繋いでいる構成も普通にあるため）。
+
+これで入力（`Device`）と出力（`Output`）が 1 画面に揃った。
+
+tests: `test_jarvis_speech.py` 13件（新規）、`test_jarvis_status.py` 74 → 79件。
+
+### 残: Capture チェックの穴
+`TURN=4`（17:29:32）は `silence_cb_fired=True` / `PEAK_RMS=1801` だが
+`FRAMES=751`（8 秒の無発話タイムアウト長）で `STT=112ms` の後 `GATE` 以降が全て `-`。
+**「音は入ったが言葉として成立しなかった」ターン**を `Capture ✓` と判定してしまう。
+STT が走ったのに GATE 以降が未実行で終わったターンの可視化は未実装。

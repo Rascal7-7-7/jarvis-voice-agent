@@ -270,6 +270,43 @@ def evaluate_shared_stream(counters: Mapping[str, Any] | None) -> Check:
     return Check("Audio", OK, summary, data)
 
 
+# ------------------------------------------------------------------ output
+#
+# 2026-09-09 実測: TTS は mp3 を生成し PLAYBACK_DURATION も記録されるのに音が出なかった。
+# 既定出力が DisplayLink ドック（Realtek USB2.0 Audio）で、そこに何も繋がって
+# いなかったため。JARVIS は「再生した」しか知らず、出力先を知る手段が無かった。
+# 出力先の名前を 1 行出すだけで、この切り分けは即答になる。
+
+# 「繋がっていなければ無音」になりやすい出力先。断定はせず注記に留める
+# （ドックにスピーカーを繋いでいる構成も普通にあるため）。
+_DETACHABLE_OUTPUT = ("usb", "displaylink", "hdmi", "realtek", "dock",
+                      "nomachine")
+
+
+def evaluate_output(device: str | None, muted: bool | None,
+                    volume: int | None) -> Check:
+    if not device:
+        return Check("Output", OK, "情報なし", {"available": False})
+
+    data = {"available": True, "device": device, "muted": muted,
+            "volume": volume}
+
+    if muted:
+        return Check("Output", WARN, f"{device} / ミュート中です", data)
+
+    if volume is not None and int(volume) == 0:
+        return Check("Output", WARN, f"{device} / 音量が 0 です", data)
+
+    lowered = device.lower()
+    if any(p in lowered for p in _DETACHABLE_OUTPUT):
+        return Check("Output", WARN,
+                     f"{device} — 機器が接続されていないと無音になります。"
+                     "音が聞こえない場合は出力先を確認してください", data)
+
+    vol = f" / 音量 {volume}" if volume is not None else ""
+    return Check("Output", OK, f"{device}{vol}", data)
+
+
 # ------------------------------------------------------------------ device
 #
 # 案C: 優先順位（外部 > 無線 > 内蔵）で選んだデバイスと実際の束縛先が食い違ったら

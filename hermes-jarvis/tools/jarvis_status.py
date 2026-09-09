@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -36,7 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from jarvis_status_checks import (  # noqa: E402
     FAIL, HEALTHY, INFO, OK, WARN, Check, current_generation, evaluate_hermes,
     evaluate_login_item, evaluate_ollama, evaluate_permission, evaluate_process,
-    evaluate_capture_health, evaluate_device, evaluate_shared_stream, evaluate_startup_warm, evaluate_state,
+    evaluate_capture_health, evaluate_device, evaluate_output, evaluate_shared_stream, evaluate_startup_warm, evaluate_state,
     evaluate_wake_lease, evaluate_watchdog, extract_counters, load_gaps,
     match_process, overall_status,
 )
@@ -182,6 +183,48 @@ def _listening(port: int) -> bool:
     return bool(out.strip())
 
 
+_OUT_DEVICE_RE = re.compile(r"^        (\S.*):\s*$")
+
+
+def _default_output() -> tuple[str | None, bool | None, int | None]:
+    """既定出力デバイス名・ミュート・音量。取れなければ None を返す。
+
+    system_profiler は数百 ms かかるので、health check としては許容範囲だが
+    失敗しても全体を落とさない。
+    """
+    device = None
+    try:
+        out = subprocess.run(["/usr/sbin/system_profiler", "SPAudioDataType"],
+                             capture_output=True, text=True, timeout=8,
+                             check=False).stdout
+        name = None
+        for line in out.splitlines():
+            m = _OUT_DEVICE_RE.match(line)
+            if m:
+                name = m.group(1)
+                continue
+            if "Default Output Device: Yes" in line:
+                device = name
+                break
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    muted = vol = None
+    try:
+        s = subprocess.run(["/usr/bin/osascript", "-e", "get volume settings"],
+                           capture_output=True, text=True, timeout=4,
+                           check=False).stdout
+        mv = re.search(r"output volume:(\d+)", s)
+        mm = re.search(r"output muted:(\w+)", s)
+        if mv:
+            vol = int(mv.group(1))
+        if mm:
+            muted = mm.group(1).strip().lower() == "true"
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    return device, muted, vol
+
+
 def _watchdog_events(lines: Sequence[str]) -> list[Mapping[str, Any]]:
     events = []
     for line in lines:
@@ -249,6 +292,7 @@ def collect() -> tuple[list[Check], list[dict[str, Any]]]:
     checks.append(evaluate_shared_stream(_counters))
     checks.append(evaluate_device(_counters))
     checks.append(evaluate_capture_health(generation))
+    checks.append(evaluate_output(*_default_output()))
     checks.append(evaluate_startup_warm(generation))
 
     tags_status, tags = _http_get(f"{OLLAMA_URL}/api/tags")

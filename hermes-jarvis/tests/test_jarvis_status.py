@@ -607,3 +607,41 @@ def test_device_check_tolerates_missing_keys():
     chk = c.evaluate_device({})
     assert chk.status == c.OK
     assert chk.data["available"] is False
+
+
+# ------------------------------------------------------------------ output
+#
+# 2026-09-09: TTS は mp3 を生成し PLAYBACK_DURATION も記録されるのに音が出なかった。
+# 既定出力が DisplayLink ドック（Realtek USB2.0 Audio）で、そこに何も繋がって
+# いなかったため。JARVIS は「再生した」しか知らず、出力先を知る手段がなかった。
+# 既定出力デバイス名を 1 行出すだけで、この切り分けは即答になる。
+
+def test_output_check_names_the_default_device():
+    chk = c.evaluate_output("MacBook Proのスピーカー", muted=False, volume=88)
+    assert chk.status == c.OK
+    assert "MacBook Proのスピーカー" in chk.detail
+
+
+def test_output_check_warns_when_muted():
+    chk = c.evaluate_output("MacBook Proのスピーカー", muted=True, volume=88)
+    assert chk.status == c.WARN
+    assert "ミュート" in chk.detail
+
+
+def test_output_check_warns_on_zero_volume():
+    chk = c.evaluate_output("MacBook Proのスピーカー", muted=False, volume=0)
+    assert chk.status == c.WARN
+    assert "音量" in chk.detail
+
+
+def test_output_check_flags_a_device_that_often_has_nothing_attached():
+    """ドック/HDMI は「繋がっていなければ無音」になりやすいので注記する。"""
+    chk = c.evaluate_output("Realtek USB2.0 Audio", muted=False, volume=88)
+    assert chk.status == c.WARN
+    assert "接続" in chk.detail
+
+
+def test_output_check_without_information_is_not_a_failure():
+    chk = c.evaluate_output(None, muted=None, volume=None)
+    assert chk.status == c.OK
+    assert chk.data["available"] is False

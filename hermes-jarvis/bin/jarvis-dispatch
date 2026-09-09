@@ -136,7 +136,16 @@ print(p.toolsets_arg(sys.argv[2]))
       print -u2 "[empty answer with toolsets='${tsets}' -- retrying with the full agent]"
       out=$(cd "$WORKDIR" && "$HOME/.local/bin/hermes" -z "$UTTERANCE" 2>/dev/null)
     fi
-    print -r -- "${out:-うまく応答できませんでした。}"
+    # 読み上げ直前のサニタイズ。この経路は C8（esac の後）を通らないので、
+    # hermes の戻り値がそのまま TTS に渡る。2026-09-09 に gemma4:e2b が
+    # テキスト形式の壊れたツール呼び出しを返し、33 秒間 JSON を読み上げた。
+    # handoff §7 の「raw tool args を出さない」を読み上げにも適用する。
+    print -r -- "${out:-うまく応答できませんでした。}" | "$PY" -c '
+import sys, os
+sys.path.insert(0, os.path.expanduser("~/AI-Lab/hermes-jarvis/bin"))
+import jarvis_speech as sp
+print(sp.sanitize(sys.stdin.read()))
+'
     exit 0
     ;;
   *)
@@ -147,7 +156,7 @@ esac
 
 # ---- C8: shrink a delegated answer to something speakable -------------------
 "$PY" - "$route" <<PYEOF
-import json, sys, urllib.request
+import json, os, sys, urllib.request
 route = sys.argv[1]
 detail = """$out"""
 body = {
@@ -169,6 +178,8 @@ try:
     said = (d["choices"][0]["message"].get("content") or "").strip()
 except Exception:
     said = ""
-print(said or (detail.strip().splitlines() or ["結果を取得しました。"])[0][:160])
+sys.path.insert(0, os.path.expanduser("~/AI-Lab/hermes-jarvis/bin"))
+import jarvis_speech as sp
+print(sp.sanitize(said or (detail.strip().splitlines() or ["結果を取得しました。"])[0]))
 print(f"\n--- {route} full output ({len(detail)} chars) kept for the HUD ---", file=sys.stderr)
 PYEOF
