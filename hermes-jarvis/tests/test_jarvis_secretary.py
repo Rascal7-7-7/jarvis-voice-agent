@@ -511,3 +511,50 @@ def test_a_project_scoped_status_is_unaffected():
     intent, _ = js.classify("秘書、it-study の状況を教えて",
                             projects=_PROJECTS, excluded=[])
     assert intent == js.INTENT_STATUS
+
+
+# ---------------------------------------------------------------- 一括テスト
+#
+# 「秘書、全プロジェクトのテストを走らせて」（2026-09-10 追加）
+
+
+def test_sweep_needs_an_explicit_all():
+    for t in ["秘書、全プロジェクトのテストを走らせて",
+              "秘書、全部のテストを実行して",
+              "秘書、テストを一括で走らせて",
+              "秘書、まとめてテストを走らせて"]:
+        intent, _ = js.classify(t, projects=_PROJECTS, excluded=[])
+        assert intent == js.INTENT_SWEEP, t
+
+
+def test_a_bare_test_request_does_not_sweep():
+    # プロジェクト名も「全部」も無い発話で6プロジェクト走らせない
+    intent, _ = js.classify("秘書、テストを走らせて", projects=_PROJECTS, excluded=[])
+    assert intent != js.INTENT_SWEEP
+    assert intent != js.INTENT_TEST
+
+
+def test_a_project_scoped_test_is_not_a_sweep():
+    intent, payload = js.classify("秘書、it-study のテストを走らせて",
+                                  projects=_PROJECTS, excluded=[])
+    assert intent == js.INTENT_TEST
+    assert payload["project"] == "it-study"
+
+
+def test_all_plus_test_beats_the_list_keyword():
+    # 「全部」は _LIST_WORDS にもあるので、判定順を間違えると
+    # 「全部のテストを実行して」が一覧表示になる（実際に起きた）
+    intent, _ = js.classify("秘書、全部のテストを実行して",
+                            projects=_PROJECTS, excluded=[])
+    assert intent == js.INTENT_SWEEP
+
+
+def test_all_without_a_test_verb_is_still_a_list():
+    intent, _ = js.classify("秘書、全部のプロジェクトを見せて",
+                            projects=_PROJECTS, excluded=[])
+    assert intent == js.INTENT_LIST
+
+
+def test_sweep_does_not_shadow_the_brief():
+    intent, _ = js.classify("秘書、状況を教えて", projects=_PROJECTS, excluded=[])
+    assert intent == js.INTENT_BRIEF

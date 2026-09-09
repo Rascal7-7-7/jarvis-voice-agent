@@ -43,6 +43,7 @@ EXCLUDE_FILE = os.path.expanduser("~/work/scripts/secretary/excluded.txt")
 INTENT_BRIEF = "BRIEF"
 INTENT_LIST = "LIST"
 INTENT_REPORTS = "REPORTS"
+INTENT_SWEEP = "SWEEP"
 INTENT_ATTENTION = "ATTENTION"
 INTENT_TEST = "TEST"
 INTENT_HISTORY = "HISTORY"
@@ -63,8 +64,13 @@ _BRIEF_WORDS = re.compile(
 _LIST_WORDS = re.compile(r"(一覧|リスト|全部|どんなプロジェクト)")
 _REPORTS_WORDS = re.compile(r"(レポート|報告書|結果を見)")
 
-# テストの実行。「直して」は作業依頼なので含めない
-_TEST_WORDS = re.compile(r"テスト.{0,3}(走らせ|実行|回し|流し|通し)")
+# テストの実行。「直して」は作業依頼なので含めない。
+# 距離は 6 まで許す（`.{0,3}` だと「テストを一括で走らせて」が外れた）
+_TEST_WORDS = re.compile(r"テスト.{0,6}(走らせ|実行|回し|流し|通し)")
+
+# 一括実行。**「全部」の明示を要求する。**
+# プロジェクト名も無い「テストを走らせて」で6プロジェクト走らせない
+_ALL_WORDS = re.compile(r"(全プロジェクト|全部|ぜんぶ|全て|すべて|一括|まとめて)")
 
 # 対応が必要なもの。「状況」より具体的なので BRIEF より先に見る
 _ATTENTION_WORDS = re.compile(
@@ -246,6 +252,12 @@ def classify(utterance: str,
     text = utterance or ""
     names = list(projects) if projects is not None else known_projects()
     blocked = set(excluded) if excluded is not None else set(excluded_projects())
+
+    # 一括テストは**2条件（「全部」＋テスト実行）を要求する**ので、
+    # 単語1つで当たる LIST / BRIEF より具体的。だから先に見る。
+    # 「全部のテストを実行して」は _LIST_WORDS の「全部」に先取りされていた。
+    if _ALL_WORDS.search(text) and _TEST_WORDS.search(text):
+        return INTENT_SWEEP, {"action": "read"}
 
     # 「対応が必要」は「状況」より具体的なので先に見る
     if _ATTENTION_WORDS.search(text):
@@ -430,6 +442,14 @@ def handle(utterance: str,
         n = len([l for l in out.splitlines() if l.strip().endswith(".md")])
         return (f"レポートは{n}件あります。" if n
                 else "レポートはまだありません。")
+
+    if intent == INTENT_SWEEP:
+        # 6プロジェクトで実測 115 秒。待たせずに投げて通知で知らせる
+        rc, _out = _run_cli(["sweep", "test"], timeout=30.0)
+        if rc != 0:
+            return "一括テストを開始できませんでした。"
+        return ("全プロジェクトのテストを開始しました。"
+                "終わったら通知します。走る対象は画面で確認できます。")
 
     if intent == INTENT_TEST:
         # テストは分単位かかる（it-study は 48s）。待たせずに投げて
