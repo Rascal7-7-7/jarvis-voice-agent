@@ -201,10 +201,17 @@ _state = {"state": "OFFLINE", "since": time.time(), "detail": ""}
 # None of these helpers may be called from inside set_state's locked region.
 _turn = {"id": None, "route": None, "timeline": None}
 
-# The six labels jarvis_router can dispatch to. CONFIRMATION_REQUIRED is a gate
+# The labels jarvis_router can dispatch to. CONFIRMATION_REQUIRED is a gate
 # verdict rather than a backend and is deliberately NOT here: nothing is
 # dispatched for it, so it never becomes a route.
-ROUTES = ("LOCAL_FAST", "LOCAL_TOOL", "LOCAL", "WEB", "CODEX", "CLAUDE")
+#
+# This list is for the turn record only -- it is NOT a gate. A label missing
+# here still dispatches, it just gets recorded as route=None, which is how
+# SECRETARY turns were losing their label until 2026-09-09.
+# SECRETARY and OPEN are reachable by deterministic override only; they are
+# absent from jarvis_router.LABELS so the LLM cannot emit them.
+ROUTES = ("LOCAL_FAST", "LOCAL_TOOL", "LOCAL", "WEB", "CODEX", "CLAUDE",
+          "SECRETARY", "OPEN")
 
 # name -> (start mark, end mark). Every one is already measured by Timeline;
 # nothing new is instrumented.

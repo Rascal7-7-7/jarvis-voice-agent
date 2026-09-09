@@ -23,7 +23,8 @@ from test_state_permissions import load_runtime_with_log_dir  # noqa: E402
 
 RUNTIME_SOURCE = os.path.expanduser("~/AI-Lab/hermes-jarvis/bin/jarvis_runtime.py")
 LATENCY_KEYS = {"wake_to_capture", "capture_duration", "stt", "router", "backend"}
-ROUTES = ("LOCAL_FAST", "LOCAL_TOOL", "LOCAL", "WEB", "CODEX", "CLAUDE")
+ROUTES = ("LOCAL_FAST", "LOCAL_TOOL", "LOCAL", "WEB", "CODEX", "CLAUDE",
+          "SECRETARY", "OPEN")
 
 
 class FakeTimeline:
