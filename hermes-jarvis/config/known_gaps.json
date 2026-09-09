@@ -1,0 +1,25 @@
+{
+  "_comment": "Known gaps shown by jarvis-status. Edited here, not in the script, so closing a gap is a data change rather than a code change. A gap NEVER makes the overall status FAIL -- it is a documented limitation, not a fault.",
+  "gaps": [
+    {
+      "id": "WAKE_WORD_RELIABILITY",
+      "status": "TUNING_PENDING",
+      "note": "Detector and audio pipeline are alive, but intentional-user recall and ambient false-positive rate are not yet reliable. Evidence 2026-09-02: openWakeWord running, feed_errors=0, and a detector-origin wake was observed firing on its own at 13:32:20 (PEAK_RMS=130, no speech) -- so the engine fires. What it missed was a deliberate \"Hey Jarvis\" earlier the same session. This is calibration, not a dead engine. Cmd+Shift+J remains the reliable path. No threshold or model change has been made."
+    },
+    {
+      "id": "CLAMSHELL_RECOVERY",
+      "status": "UNVERIFIED",
+      "note": "Recovery from a clamshell sleep/wake cycle has never been observed."
+    },
+    {
+      "id": "REAL_LOGIN_WARM_VALIDATION",
+      "status": "PENDING",
+      "note": "The readiness-aware startup warm passed a controlled race test (ollama absent at runtime start, bound 7s later). A real logout/login has not yet exercised it."
+    },
+    {
+      "id": "EARLY_TURN_DURING_WARM",
+      "status": "UNVERIFIED",
+      "note": "A turn started while the startup warm is still retrying is unmeasured. Argued safe -- Ollama serves one runner per model -- but not observed."
+    }
+  ]
+}

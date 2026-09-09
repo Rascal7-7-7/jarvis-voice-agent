@@ -1,0 +1,164 @@
+"""JARVIS router — deterministic gate first, LLM second.
+
+    utterance
+       │
+       ▼  normalize (NFKC, whitespace)
+    [1] jarvis_gate.check()        ← deterministic. CONFIRMATION_REQUIRED stops here.
+       │  safe
+       ▼
+    [2] explicit user override     ← deterministic. 「Codexに見てもらって」 etc.
+       │  none
+       ▼
+    [3] gemma4:e2b, reasoning_effort=none, enum-constrained
+       │
+       ▼  LOCAL | WEB | CODEX | CLAUDE
+
+The LLM is step 3 and only step 3. It never sees a dangerous utterance and it
+cannot un-gate one, because step 1 returns before it runs. `reason` from the
+model is carried for logging and is NEVER consulted for a safety decision.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import time
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import jarvis_gate  # noqa: E402
+
+OLLAMA = os.environ.get("JARVIS_OLLAMA", "http://127.0.0.1:11434/v1/chat/completions")
+MODEL = os.environ.get("JARVIS_ROUTER_MODEL", "gemma4:e2b")
+TIMEOUT = float(os.environ.get("JARVIS_ROUTER_TIMEOUT", "20"))
+
+LABELS = ("LOCAL", "WEB", "CODEX", "CLAUDE", "CONFIRMATION_REQUIRED")
+
+SYSTEM = (
+    "あなたはJarvisのルーターです。ユーザーの発話を次の4つのいずれか1つに分類します。\n"
+    "LOCAL  : 雑談・挨拶・簡単な質問。ローカルで即答できるもの。\n"
+    "WEB    : 最新情報・ニュース・調べ物。インターネット検索が必要なもの。\n"
+    "CODEX  : コードの修正・実装・デバッグ・エラー解決・テスト・コードレビュー。\n"
+    "CLAUDE : 設計・アーキテクチャ比較・脅威モデリング・長い推論・多面的な検討。\n"
+    "ラベルを1語だけ出力してください。説明は不要です。"
+)
+
+# ---- step 2: explicit overrides. Deterministic, so the user always wins over
+# the model — but never over step 1.
+_OVERRIDES = (
+    ("CODEX", re.compile(r"(コーデックス|codex)", re.IGNORECASE)),
+    ("CLAUDE", re.compile(r"(クロード|claude)", re.IGNORECASE)),
+    ("WEB", re.compile(r"(ウェブで|webで|ネットで|検索して|ググって|クロームで|chromeで)", re.IGNORECASE)),
+    ("LOCAL", re.compile(r"(ローカルだけ|ローカルで答え|オフラインで)", re.IGNORECASE)),
+)
+
+# ---- step 2b: high-precision deterministic fast paths.
+#
+# Two reasons this exists, both measured:
+#   latency — the LLM step costs ~2.2 s on gemma4:e2b and does NOT shrink with
+#     max_tokens (24 -> 2 changed nothing: 2.28 s -> 2.19 s). The only way under
+#     that floor is to not call the model.
+#   accuracy — 「このテストが落ちる原因を調べて」 routed to WEB because 調べて is
+#     the canonical WEB verb, even though a failing test is a CODEX task.
+#
+# Only unambiguous signals belong here. Anything debatable stays with the LLM.
+_FAST = (
+    # WEB is evaluated FIRST: an explicit WEB signal (最新バージョン, ニュース…)
+    # should win over a weaker CODEX hint in the same utterance.
+    ("WEB", re.compile(
+        r"(ニュース|天気|為替|円安|円高|株価|相場|時事|"
+        r"最新(の)?(情報|動向|バージョン|リリース))", re.IGNORECASE)),
+    ("CODEX", re.compile(
+        r"(エラー|バグ|デバッグ|例外|スタックトレース|コンパイル|型エラー|"
+        r"テストが落ち|テストが通らな|ビルドが通らな|リファクタ|"
+        r"\.(py|tsx|jsx|php|rb|go|rs|sql|java|kt|swift)(?![A-Za-z0-9_])|"
+        # NOTE: .js/.ts deliberately absent — they match inside product
+        # names (Next.js, Node.js, Vue.js). Measured: "Next.jsの最新
+        # バージョンは?" was routed CODEX by the .js branch.
+        
+        r"(?<![A-Za-z0-9_])(traceback|exception|syntaxerror|typeerror)(?![A-Za-z0-9_]))",
+        re.IGNORECASE)),
+)
+
+
+def _llm_route(text: str) -> tuple[str | None, float, str]:
+    body = {
+        "model": MODEL,
+        "messages": [{"role": "system", "content": SYSTEM},
+                     {"role": "user", "content": text}],
+        "max_tokens": 24,
+        "temperature": 0,
+        "reasoning_effort": "none",   # the only flag Ollama's /v1 honours
+    }
+    req = urllib.request.Request(OLLAMA, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    t0 = time.perf_counter()
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            d = json.load(r)
+        raw = (d["choices"][0]["message"].get("content") or "").strip()
+    except Exception as e:
+        return None, time.perf_counter() - t0, f"llm_error:{type(e).__name__}"
+    dt = time.perf_counter() - t0
+    up = raw.upper()
+    for lab in sorted(LABELS, key=len, reverse=True):
+        if lab in up:
+            return lab, dt, raw
+    return None, dt, raw
+
+
+# Paths and URLs are DATA, not intent. Measured: an utterance containing
+# /private/tmp/claude-502/... matched the CLAUDE override and was delegated to
+# Claude purely because the sandbox path happens to contain the word "claude".
+# Strip those spans before looking for an explicit override or a fast path.
+_PATHLIKE = re.compile(r"(https?://\S+|~?/[^\s\"']+|[A-Za-z]:\\\\[^\s\"']+)")
+
+
+def _intent_text(text: str) -> str:
+    return _PATHLIKE.sub(" ", text)
+
+
+def route(utterance: str) -> dict:
+    t0 = time.perf_counter()
+    text = jarvis_gate.normalize(utterance)
+    intent = _intent_text(text)
+
+    gated = jarvis_gate.check(text)
+    if gated["route"]:
+        return {"route": "CONFIRMATION_REQUIRED", "decided_by": "security_gate",
+                "categories": gated["categories"], "matched": gated["matched"],
+                "llm_used": False, "latency": round(time.perf_counter() - t0, 3),
+                "utterance": text}
+
+    for lab, pat in _OVERRIDES:
+        if pat.search(intent):
+            return {"route": lab, "decided_by": "explicit_override",
+                    "categories": [], "llm_used": False,
+                    "latency": round(time.perf_counter() - t0, 3), "utterance": text}
+
+    for lab, pat in _FAST:
+        if pat.search(intent):
+            return {"route": lab, "decided_by": "fast_path",
+                    "categories": [], "llm_used": False,
+                    "latency": round(time.perf_counter() - t0, 3), "utterance": text}
+
+    lab, llm_dt, raw = _llm_route(text)
+    total = time.perf_counter() - t0
+    if lab is None or lab == "CONFIRMATION_REQUIRED":
+        # The model must not be able to invent a CONFIRMATION verdict (that is
+        # the gate's job) nor leave us without one. Unparseable -> LOCAL, the
+        # least-privilege destination.
+        return {"route": "LOCAL", "decided_by": "llm_fallback",
+                "categories": [], "llm_used": True, "llm_raw": raw[:60],
+                "llm_latency": round(llm_dt, 3), "latency": round(total, 3),
+                "utterance": text}
+    return {"route": lab, "decided_by": "llm", "categories": [], "llm_used": True,
+            "llm_raw": raw[:60], "llm_latency": round(llm_dt, 3),
+            "latency": round(total, 3), "utterance": text}
+
+
+if __name__ == "__main__":
+    items = sys.argv[1:] or [l.strip() for l in sys.stdin if l.strip()]
+    for it in items:
+        print(json.dumps(route(it), ensure_ascii=False))

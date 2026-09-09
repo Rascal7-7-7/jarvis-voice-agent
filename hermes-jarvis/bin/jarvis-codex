@@ -1,0 +1,120 @@
+#!/bin/zsh
+# jarvis-codex — fixed-argv Codex delegation for Hermes JARVIS.
+#
+# WHY A WRAPPER AND NOT THE RAW CLI:
+#   The LLM must not be able to choose the sandbox mode, the model, the base
+#   URL, or the timeout. Those are pinned here; the model only supplies a
+#   prompt and a directory, and the directory is checked against an allowlist.
+#
+# WHY THE OVERRIDES:
+#   ~/.codex/config.toml sets openai_base_url = http://127.0.0.1:17841/v1,
+#   a proxy owned by "Codex Web GPT.app". When that app is not running, codex
+#   retries the dead endpoint FOREVER ("Reconnecting... waiting for network")
+#   instead of failing — measured at >10 minutes with no exit. It also pins
+#   model = "chatgpt-web/high", a synthetic name only that proxy understands
+#   ("The 'chatgpt-web/high' model is not supported when using Codex with a
+#   ChatGPT account").
+#   Passing -c openai_base_url="" -m <real model> per invocation routes through
+#   the ChatGPT subscription directly. ~/.codex/config.toml is NEVER written.
+#
+# WHY THE TIMEOUT:
+#   see above — codex does not self-terminate on a dead endpoint.
+#
+# READ-ONLY: --sandbox read-only is hardcoded. There is no write mode in this
+# script. A write path, when it exists, will be a separate reviewed script.
+
+set -u
+emulate -L zsh
+
+CODEX_BIN="${JARVIS_CODEX_BIN:-$HOME/.nvm/versions/node/v24.14.1/bin/codex}"
+MODEL="${JARVIS_CODEX_MODEL:-gpt-5.5}"
+TIMEOUT="${JARVIS_CODEX_TIMEOUT:-150}"
+
+# Directories Codex may be pointed at. Anything else is refused.
+ALLOWED_ROOTS=(
+  "$HOME/AI-Lab/hermes-jarvis"
+  "$HOME/work"
+)
+
+usage() {
+  print -u2 "usage: jarvis-codex <directory> <prompt...>"
+  exit 64
+}
+
+[[ $# -ge 2 ]] || usage
+TARGET_DIR="${1:A}"     # :A = absolute, symlinks resolved
+shift
+PROMPT="$*"
+
+[[ -d "$TARGET_DIR" ]] || { print -u2 "jarvis-codex: not a directory: $TARGET_DIR"; exit 66; }
+
+allowed=0
+for root in $ALLOWED_ROOTS; do
+  if [[ "$TARGET_DIR" == "${root:A}" || "$TARGET_DIR" == "${root:A}"/* ]]; then
+    allowed=1; break
+  fi
+done
+if (( ! allowed )); then
+  print -u2 "jarvis-codex: refused — $TARGET_DIR is outside the allowlist"
+  print -u2 "  allowed roots: $ALLOWED_ROOTS"
+  exit 77
+fi
+
+[[ -x "$CODEX_BIN" ]] || { print -u2 "jarvis-codex: codex not executable at $CODEX_BIN"; exit 69; }
+
+# Hard timeout: run codex in its own process group and kill the group on expiry.
+"$HOME/.hermes-venv/bin/python" - "$CODEX_BIN" "$TARGET_DIR" "$MODEL" "$TIMEOUT" "$PROMPT" <<'PYEOF'
+import os, signal, subprocess, sys, time
+
+codex_bin, target_dir, model, timeout_s, prompt = sys.argv[1:6]
+cmd = [
+    codex_bin, "exec",
+    "--sandbox", "read-only",        # pinned; the model cannot change this
+    "--skip-git-repo-check",
+    "-C", target_dir,
+    "-c", 'openai_base_url=""',      # bypass the dead codex-chatgpt-web proxy
+    "-m", model,
+    prompt,
+]
+t0 = time.time()
+p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                     stdin=subprocess.DEVNULL, text=True, preexec_fn=os.setsid)
+try:
+    out, _ = p.communicate(timeout=float(timeout_s))
+    rc = p.returncode
+except subprocess.TimeoutExpired:
+    os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+    try:
+        out, _ = p.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        out = ""
+    print(f"CODEX_TIMEOUT after {timeout_s}s — Codexを利用できませんでした（応答なし）", file=sys.stderr)
+    sys.exit(75)
+
+dt = time.time() - t0
+if rc != 0:
+    tail = "\n".join((out or "").strip().splitlines()[-6:])
+    print(f"CODEX_ERROR exit={rc} after {dt:.1f}s\n{tail}", file=sys.stderr)
+    sys.exit(70)
+
+# Keep only codex's FINAL answer. `codex exec` streams a full trace first
+# (session banner, every `exec` it ran, the intermediate reasoning), then
+# prints "tokens used" / <count> / <final answer>. Hermes only wants the last
+# part — the trace would otherwise be read aloud by the TTS.
+lines = (out or "").splitlines()
+marker = None
+for i, l in enumerate(lines):
+    if l.strip() == "tokens used":
+        marker = i
+if marker is not None:
+    tail = lines[marker + 1:]
+    if tail and tail[0].strip().replace(",", "").isdigit():
+        tail = tail[1:]
+    body = "\n".join(tail).strip()
+else:
+    body = (out or "").strip()
+print(body or (out or "").strip())
+print(f"\n[jarvis-codex: model={model} sandbox=read-only approval=never(exec) wall={dt:.1f}s]",
+      file=sys.stderr)
+PYEOF

@@ -1,0 +1,597 @@
+"""JARVIS always-on runtime — background wake listener, no Terminal required.
+
+    launchd ──► this process ──► tools.wake_word detector (upstream)
+                                        │  "Hey Jarvis"
+                                        ▼
+                                 pause listener (releases the mic)
+                                        ▼
+                                 tools.voice_mode.AudioRecorder (upstream + the
+                                        │                        dynamic-mic patch)
+                                        ▼
+                                 transcribe_recording (upstream, faster-whisper)
+                                        ▼
+                                 jarvis_gate ─► jarvis_router ─► dispatch
+                                        ▼
+                                 speak_text (upstream TTS)
+                                        ▼
+                                 resume listener
+
+Everything except the loop itself is upstream API. `tools/` is not forked; the
+only local change to the Hermes tree remains the AudioRecorder device-follow
+patch from an earlier phase.
+
+WHY A DEDICATED PROCESS
+  The gateway hosts no wake listener. tui_gateway's `wake.start` is
+  client-driven — a connected transport calls it and owns it — so it is not a
+  headless host either. `hermes chat` needs the interactive TUI. A small
+  supervised process is the only shape that satisfies "no Terminal window".
+
+WHY NO .app HELPER
+  Measured on this machine: a launchd-started process using
+  ~/.hermes-venv/bin/python captured REAL audio 3/3 (peak 2498-3090,
+  3781-4137 distinct sample values). The Microphone grant follows the binary,
+  not the parent, so no bundle identity work is required.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SRC = os.path.expanduser("~/AI-Lab/hermes-jarvis/src/hermes-agent-v2026.8.27")
+sys.path.insert(0, SRC)
+sys.path.insert(0, HERE)
+
+LOG_DIR = os.path.expanduser("~/AI-Lab/hermes-jarvis/logs")
+STATE_PATH = os.path.join(LOG_DIR, "jarvis_state.json")
+LOCK_PATH = os.path.join(LOG_DIR, "jarvis_runtime.lock")
+MAX_LOG_BYTES = 5 * 1024 * 1024
+
+OLLAMA_URL = "http://127.0.0.1:11434"
+ROUTER_MODEL = "gemma4:e2b"
+
+# Measured on this machine, 2026-08-29, from the first real background turn:
+#   capture 15.65 s = 11.74 s of the user not speaking yet
+#                   + 0.72 s of speech
+#                   + 3.01 s of silence  (voice.silence_duration = 3.0)
+# The recorder behaved exactly as configured; 3.0 s is simply a long tail to pay
+# on every turn. These two overrides are set on the RUNTIME'S OWN AudioRecorder
+# instance only -- ~/.hermes/config.yaml is untouched, so `hermes chat` and
+# Ctrl+B push-to-talk keep the original 3.0 s. The RMS threshold is deliberately
+# NOT touched: that is voice sensitivity, and the measurement showed it was
+# never the problem (speech peaked at 4413 against a 47 noise floor).
+SILENCE_DURATION_SECONDS = 1.2
+# How long to wait for the user to start talking at all before giving up. The
+# upstream default lets a silent turn run for the full recording cap.
+MAX_WAIT_FOR_SPEECH_SECONDS = 8.0
+
+os.makedirs(LOG_DIR, exist_ok=True)
+logger = logging.getLogger("jarvis")
+
+
+# --------------------------------------------------------------------------- log
+def _setup_logging() -> None:
+    path = os.path.join(LOG_DIR, "jarvis_runtime.log")
+    # Size-capped by hand: launchd does not rotate, and an always-on listener
+    # would otherwise grow without bound.
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > MAX_LOG_BYTES:
+            os.replace(path, path + ".1")
+    except OSError:
+        pass
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[logging.FileHandler(path), logging.StreamHandler(sys.stdout)],
+    )
+
+
+# ------------------------------------------------------------------ single instance
+class SingleInstance:
+    """One runtime per machine. A stale lock from a killed process is reclaimed."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.fd = None
+
+    def __enter__(self):
+        import fcntl
+        self.fd = open(self.path, "w")
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self.fd.close()
+            raise RuntimeError("another jarvis_runtime already holds the lock")
+        self.fd.write(f"{os.getpid()}\n")
+        self.fd.flush()
+        return self
+
+    def __exit__(self, *exc):
+        import fcntl
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            self.fd.close()
+        except Exception:
+            pass
+
+
+# ------------------------------------------------------------------------- state
+_state_lock = threading.Lock()
+_state = {"state": "OFFLINE", "since": time.time(), "detail": ""}
+
+
+def set_state(name: str, detail: str = "") -> None:
+    """Publish the HUD state. A file, not a socket: the HUD is read-only and
+    must never be able to reach back into the runtime."""
+    with _state_lock:
+        _state.update(state=name, since=time.time(), detail=detail)
+        payload = dict(_state)
+    payload["pid"] = os.getpid()
+    tmp = STATE_PATH + ".tmp"
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        os.replace(tmp, STATE_PATH)
+    except OSError:
+        pass
+    logger.info("state=%s %s", name, detail)
+
+
+# ----------------------------------------------------------------------- timeline
+class Timeline:
+    """Monotonic marks for one turn, reported as intervals in ms.
+
+    time.monotonic() and not time.time(): a turn can straddle an NTP step or a
+    sleep/wake, and a wall clock that jumps backwards produces negative
+    latencies that look like a bug in the pipeline instead of a bug in the
+    clock.
+    """
+
+    ORDER = (
+        "wake_detected", "capture_start", "capture_end", "stt_start", "stt_done",
+        "gate_start", "gate_done", "router_start", "router_done",
+        "delegate_start", "delegate_done", "tts_start", "tts_first_audio",
+        "tts_done", "wake_rearmed",
+    )
+    # label -> (from mark, to mark)
+    INTERVALS = (
+        ("WAKE", "wake_detected", "capture_start"),
+        ("CAPTURE", "capture_start", "capture_end"),
+        ("STT", "stt_start", "stt_done"),
+        ("GATE", "gate_start", "gate_done"),
+        ("ROUTER", "router_start", "router_done"),
+        ("TTS", "tts_start", "tts_first_audio"),
+    )
+
+    def __init__(self) -> None:
+        self.marks: dict[str, float] = {}
+        self.route = ""
+
+    def mark(self, name: str) -> None:
+        self.marks.setdefault(name, time.monotonic())
+
+    def mark_at(self, name: str, when: float) -> None:
+        """Place a mark at a known instant rather than at 'now'.
+
+        Needed where one call does two measurable things: the router runs the
+        deterministic gate and then the LLM inside a single route(), and it
+        already reports how long each took. Deriving the boundary from its own
+        numbers is honest; timing it from out here would just report the whole
+        call twice under two names.
+        """
+        self.marks.setdefault(name, when)
+
+    def _ms(self, a: str, b: str):
+        if a in self.marks and b in self.marks:
+            return (self.marks[b] - self.marks[a]) * 1000.0
+        return None
+
+    def report(self) -> str:
+        parts = []
+        for label, a, b in self.INTERVALS:
+            v = self._ms(a, b)
+            parts.append(f"{label}={v:.0f}" if v is not None else f"{label}=-")
+
+        # LOCAL / CODEX / CLAUDE are the same interval under the name of
+        # whichever route actually ran, so a log line says where the time went
+        # without having to cross-reference the route decision.
+        delegate = self._ms("delegate_start", "delegate_done")
+        for name in ("LOCAL", "CODEX", "CLAUDE"):
+            hit = delegate if self.route == name else None
+            parts.append(f"{name}={hit:.0f}" if hit is not None else f"{name}=-")
+
+        total = self._ms("wake_detected", "tts_first_audio")
+        parts.append(f"TOTAL_TO_FIRST_AUDIO={total:.0f}" if total is not None
+                     else "TOTAL_TO_FIRST_AUDIO=-")
+        return "timeline " + " ".join(f"{p}ms" if not p.endswith("=-") else p
+                                      for p in parts)
+
+    def marks_report(self) -> str:
+        t0 = self.marks.get("wake_detected")
+        if t0 is None:
+            return "marks (no wake mark)"
+        got = [(n, (self.marks[n] - t0) * 1000.0) for n in self.ORDER if n in self.marks]
+        return "marks " + " ".join(f"{n}=+{v:.0f}ms" for n, v in got)
+
+
+# -------------------------------------------------------------------------- warm
+def _warm_ollama(reason: str) -> None:
+    """Load the router model into Ollama without asking it to think.
+
+    WHY THIS AND NOT RESIDENCY. gemma4:e2b is 7.23 GB and this is a 32 GB
+    machine that also runs Claude and Codex, so pinning it with keep_alive=-1
+    taxes every other tool all day for a model used a few seconds per turn.
+    Measured cold, the router took 17.67 s; warm it takes 2.3-3.9 s. Warming at
+    startup and again the instant the wake word fires buys the warm number
+    without the resident footprint, because the load overlaps the seconds the
+    user spends actually speaking.
+    """
+    import urllib.request
+
+    body = json.dumps({
+        "model": ROUTER_MODEL,
+        "messages": [{"role": "user", "content": "ok"}],
+        "max_tokens": 1, "temperature": 0, "reasoning_effort": "none",
+    }).encode()
+    req = urllib.request.Request(f"{OLLAMA_URL}/v1/chat/completions", data=body,
+                                 headers={"Content-Type": "application/json"})
+    t = time.monotonic()
+    try:
+        urllib.request.urlopen(req, timeout=120).read()
+        logger.info("ollama warm (%s): %s ready in %.2fs", reason, ROUTER_MODEL,
+                    time.monotonic() - t)
+    except Exception as e:
+        logger.warning("ollama warm (%s) failed: %s", reason, type(e).__name__)
+
+
+def _warm_whisper() -> None:
+    """Pay the faster-whisper load once, at startup, off the hot path.
+
+    Upstream already caches the model for the process lifetime
+    (tools/transcription_tools.py keeps a module-global under a lock, and
+    unload_after_idle_seconds is 0 here, so it is never dropped). What it does
+    NOT do is load it before it is first needed -- so the first turn after a
+    reboot paid 6.16 s of load plus a huggingface metadata round trip inside
+    the turn. Nothing is cached that upstream did not already cache; the load
+    is only moved earlier.
+
+    Deliberately warmed by transcribing a throwaway tone through the ordinary
+    public entry point rather than by reaching for `_load_local_whisper_model`.
+    The private loader would skip the model-name normalization and the global
+    bookkeeping around it, and would then be primed under a name the real call
+    might not match -- which would silently load the model twice.
+    """
+    import math
+    import struct
+    import tempfile
+    import wave
+
+    t = time.monotonic()
+    path = None
+    try:
+        from tools import transcription_tools as tt
+        from tools import voice_mode as vm
+
+        # 0.6 s of quiet tone. Silence would be stripped by the VAD before the
+        # model was ever consulted, which would warm nothing.
+        rate = 16000
+        n = int(rate * 0.6)
+        frames = b"".join(
+            struct.pack("<h", int(2500 * math.sin(2 * math.pi * 220 * i / rate)))
+            for i in range(n)
+        )
+        fd, path = tempfile.mkstemp(suffix=".wav", prefix="jarvis_warm_")
+        os.close(fd)
+        with wave.open(path, "wb") as fh:
+            fh.setnchannels(1)
+            fh.setsampwidth(2)
+            fh.setframerate(rate)
+            fh.writeframes(frames)
+
+        vm.transcribe_recording(path)
+        cached = getattr(tt, "_local_model", None) is not None
+        logger.info("whisper warm: %.2fs cached=%s name=%r", time.monotonic() - t,
+                    cached, getattr(tt, "_local_model_name", None))
+    except Exception as e:
+        logger.warning("whisper warm failed: %s (%s)", type(e).__name__, e)
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+# -------------------------------------------------------------------------- main
+_stop = threading.Event()
+
+
+def _handle_signal(signum, _frame):
+    logger.info("signal %s — shutting down", signum)
+    _stop.set()
+
+
+def _dispatch(transcript: str, tl: "Timeline") -> str:
+    """Gate -> route -> delegate. Returns what should be spoken."""
+    import jarvis_router
+
+    # The gate runs inside jarvis_router.route(); it is marked separately here
+    # so a slow turn can be attributed without guessing. It is pure pattern
+    # matching and is expected to be sub-millisecond -- if it ever is not, that
+    # is a finding, which is exactly why it gets its own interval.
+    tl.mark("gate_start")
+    tl.mark("router_start")
+    decision = jarvis_router.route(transcript)
+    tl.mark("router_done")
+
+    # route() is gate-then-LLM in one call and reports both, so the gate/LLM
+    # boundary comes from its own numbers instead of being invented here.
+    # A turn the gate or the fast path settled never reaches the LLM, and then
+    # the whole call *is* the gate.
+    _total = float(decision.get("latency") or 0.0)
+    _llm = float(decision.get("llm_latency") or 0.0) if decision.get("llm_used") else 0.0
+    tl.mark_at("gate_done", tl.marks["router_start"] + max(0.0, _total - _llm))
+
+    route = decision["route"]
+    tl.route = route
+    set_state("ROUTING", f"{route} via {decision['decided_by']}")
+    logger.info("route=%s by=%s cats=%s llm_latency=%s", route,
+                decision["decided_by"], decision.get("categories"),
+                decision.get("llm_latency"))
+
+    if route == "CONFIRMATION_REQUIRED":
+        set_state("CONFIRMATION_REQUIRED", ",".join(decision.get("categories") or []))
+        cats = "・".join(decision.get("categories") or [])
+        # Speech only. Nothing is dispatched, nothing is executed.
+        return f"その操作は取り消せない可能性があります。{cats}に該当します。実行してよろしいですか？"
+
+    set_state(route, "working")
+    dispatch = os.path.join(HERE, "jarvis-dispatch")
+
+    # Hand the decision down instead of letting jarvis-dispatch re-derive it.
+    # It used to run the whole router a second time in a second process -- a
+    # measured 2.3-3.9 s warm, and 17.67 s on the cold turn that prompted this
+    # work. The route travels in the environment rather than in argv so that
+    # the utterance stays the one and only positional argument.
+    #
+    # This is a fast path, NOT a trust boundary: jarvis-dispatch still refuses
+    # to execute anything for CONFIRMATION_REQUIRED, and the deterministic gate
+    # has already run here, upstream of the LLM. A route arriving by env can
+    # only pick among the same labels the router itself could have returned.
+    env = dict(os.environ)
+    env["JARVIS_ROUTE"] = route
+    env["JARVIS_ROUTE_BY"] = str(decision.get("decided_by") or "")
+    env["JARVIS_ROUTE_CATS"] = ",".join(decision.get("categories") or [])
+
+    tl.mark("delegate_start")
+    try:
+        p = subprocess.run([dispatch, transcript], capture_output=True, text=True,
+                           timeout=300, env=env)
+        out = (p.stdout or "").strip()
+        return out or "うまく応答できませんでした。"
+    except subprocess.TimeoutExpired:
+        return "処理に時間がかかりすぎたため中断しました。"
+    except Exception as e:
+        logger.exception("dispatch failed")
+        return f"内部エラーが発生しました。{type(e).__name__}"
+    finally:
+        tl.mark("delegate_done")
+
+
+def _tune_recorder(rec) -> None:
+    """Shorten the two waits that are pure dead time, and nothing else.
+
+    Set per instance. ~/.hermes/config.yaml is not written, so every other
+    surface keeps the values the user chose. The RMS threshold is not among
+    these: it is voice sensitivity, and it was measured innocent.
+    """
+    for attr, value in (("_silence_duration", SILENCE_DURATION_SECONDS),
+                        ("_max_wait", MAX_WAIT_FOR_SPEECH_SECONDS)):
+        if hasattr(rec, attr):
+            setattr(rec, attr, value)
+        else:
+            # Upstream renamed it. Say so instead of silently running with the
+            # default and reporting a tuning that never took effect.
+            logger.warning("recorder has no %s -- capture tuning not applied", attr)
+    logger.info("recorder tuned: silence_duration=%ss max_wait=%ss threshold=%s (untouched)",
+                getattr(rec, "_silence_duration", "?"),
+                getattr(rec, "_max_wait", "?"),
+                getattr(rec, "_silence_threshold", "?"))
+
+
+def _handle_wake(recorder_box: dict) -> None:
+    from hermes_cli import voice as hvoice
+    from tools import voice_mode as vm
+    from tools import wake_word as ww
+
+    tl = Timeline()
+    tl.mark("wake_detected")
+    owner = recorder_box["owner"]
+
+    # The router model may have been dropped by Ollama's keep_alive while the
+    # machine sat idle. Start loading it NOW, in the background, so it warms
+    # while the user is still speaking instead of after they finish.
+    threading.Thread(target=_warm_ollama, args=("wake",), daemon=True).start()
+
+    try:
+        if not ww.pause_listening(owner=owner):
+            logger.warning("wake fired but the listener lease was not ours")
+            return
+
+        set_state("LISTENING", "capturing utterance")
+        rec = recorder_box.get("rec")
+        if rec is None:
+            rec = vm.AudioRecorder()
+            recorder_box["rec"] = rec
+            _tune_recorder(rec)
+
+        done = threading.Event()
+        tl.mark("capture_start")
+        rec.start(on_silence_stop=done.set)
+        # VAD auto-stop, with a hard ceiling so a stuck stream cannot hold the
+        # mic forever.
+        done.wait(timeout=30)
+        wav = rec.stop()
+        tl.mark("capture_end")
+        if not wav:
+            set_state("IDLE", "no speech")
+            return
+
+        set_state("THINKING", "transcribing")
+        tl.mark("stt_start")
+        res = vm.transcribe_recording(wav)
+        tl.mark("stt_done")
+        transcript = (res.get("transcript") or "").strip() if isinstance(res, dict) else ""
+        logger.info("transcript=%r", transcript)
+        if not transcript:
+            set_state("IDLE", "empty transcript")
+            return
+
+        reply = _dispatch(transcript, tl)
+        set_state("SPEAKING", reply[:60])
+        tl.mark("tts_start")
+        try:
+            hvoice.speak_text(reply)
+            # speak_text blocks until playback finishes, so it cannot
+            # distinguish first audio from last. Both marks are set from the
+            # same instant and TTS= therefore reads as synthesis+playback, not
+            # as time-to-first-sample. Called out rather than papered over: a
+            # split would need an upstream callback that does not exist.
+            tl.mark("tts_first_audio")
+            tl.mark("tts_done")
+        except Exception:
+            logger.exception("TTS failed")
+    finally:
+        try:
+            ww.resume_listening(owner=recorder_box["owner"])
+        except Exception:
+            logger.exception("failed to resume the wake listener")
+        tl.mark("wake_rearmed")
+        set_state("IDLE", "waiting for wake word")
+        logger.info("%s", tl.report())
+        logger.info("%s", tl.marks_report())
+
+
+def main() -> int:
+    _setup_logging()
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
+    set_state("OFFLINE", "starting")
+
+    from tools import wake_word as ww
+
+    cfg = ww.load_wake_word_config()
+    if not cfg.get("enabled"):
+        logger.error("wake_word.enabled is false — nothing to do")
+        set_state("OFFLINE", "wake word disabled in config")
+        return 78
+
+    owner = object()
+    box = {"owner": owner, "rec": None}
+    inflight = threading.Lock()
+
+    def on_wake():
+        # The detector fires from its own thread; never block it.
+        if not inflight.acquire(blocking=False):
+            logger.info("wake ignored — a turn is already in flight")
+            return
+        def run():
+            try:
+                _handle_wake(box)
+            finally:
+                inflight.release()
+        threading.Thread(target=run, daemon=True).start()
+
+    # The wake microphone is a MACHINE-WIDE lease (~/.hermes/runtime/wake-word.lock).
+    # An interactive `hermes chat` claims it too, so the runtime must not die when
+    # the user happens to have a session open — under launchd that would be a
+    # crash loop. Wait for the lease instead, and take over the moment it frees.
+    detector = None
+    backoff = 5.0
+    while detector is None and not _stop.is_set():
+        try:
+            detector = ww.start_listening(on_wake, owner=owner, config=cfg)
+        except ww.WakeWordInUse:
+            set_state("OFFLINE", "wake mic owned by another surface (hermes chat?) — waiting")
+            logger.info("wake mic already owned; retrying in %.0fs", backoff)
+            _stop.wait(backoff)
+            backoff = min(backoff * 1.5, 60.0)
+        except Exception as e:
+            set_state("ERROR", f"listener start failed: {type(e).__name__}")
+            logger.exception("failed to start the wake listener; retrying in %.0fs", backoff)
+            _stop.wait(backoff)
+            backoff = min(backoff * 1.5, 60.0)
+    if detector is None:
+        set_state("OFFLINE", "stopped before acquiring the wake mic")
+        return 0
+    d = detector.input_device_details or {}
+    logger.info("wake listener up: device=%r rate=%s phrase=%r provider=%s",
+                d.get("name"), d.get("default_samplerate"),
+                cfg.get("phrase"), cfg.get("provider"))
+    set_state("IDLE", f"listening on {d.get('name')}")
+
+    # Warm the two cold starts that the first real turn would otherwise pay for
+    # inside the turn: 6.16 s of faster-whisper load (plus a huggingface
+    # metadata round trip) and 17.67 s of gemma4:e2b load. Done after the
+    # listener is up, so "Hey Jarvis" already works while this finishes, and on
+    # a thread so a slow or absent Ollama cannot delay the listener.
+    threading.Thread(target=_warm_whisper, daemon=True).start()
+    threading.Thread(target=_warm_ollama, args=("startup",), daemon=True).start()
+
+    # Health watchdog. Upstream already flags a stream that delivers only
+    # silence (audio_silent after ~10 s); after a sleep/wake the CoreAudio
+    # handle can survive as a live-but-dead stream, which looks exactly like
+    # that. Restarting the listener re-resolves the default device too.
+    last_restart = 0.0
+    while not _stop.is_set():
+        _stop.wait(5.0)
+        if _stop.is_set():
+            break
+        try:
+            if getattr(detector, "audio_silent", False) and not inflight.locked():
+                now = time.time()
+                if now - last_restart > 60:
+                    logger.warning("listener reports silence — restarting it")
+                    set_state("ERROR", "mic silent; restarting listener")
+                    last_restart = now
+                    try:
+                        detector.pause()
+                        time.sleep(0.5)
+                        detector.resume()
+                        d = detector.input_device_details or {}
+                        logger.info("listener restarted on device=%r", d.get("name"))
+                        set_state("IDLE", f"listening on {d.get('name')}")
+                    except Exception:
+                        logger.exception("listener restart failed")
+        except Exception:
+            logger.exception("watchdog error")
+
+    logger.info("stopping")
+    try:
+        ww.stop_listening(owner=owner)
+    except Exception:
+        pass
+    rec = box.get("rec")
+    if rec is not None:
+        try:
+            rec.shutdown()
+        except Exception:
+            pass
+    set_state("OFFLINE", "stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        with SingleInstance(LOCK_PATH):
+            sys.exit(main())
+    except RuntimeError as e:
+        print(f"jarvis_runtime: {e}", file=sys.stderr)
+        sys.exit(75)

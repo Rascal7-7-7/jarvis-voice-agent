@@ -1,0 +1,7 @@
+{
+ "runs": 24,
+ "median_latency": 3.7785,
+ "max_latency": 5.686,
+ "defects": 0,
+ "median_answer_chars": 60.0
+}

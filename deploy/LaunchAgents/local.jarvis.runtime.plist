@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HERMES_HOME</key>
+		<string>/Users/Rascal/.hermes</string>
+		<key>JARVIS_WORKDIR</key>
+		<string>/Users/Rascal/AI-Lab/hermes-jarvis/fixtures/codex-readonly</string>
+		<key>PATH</key>
+		<string>/Users/Rascal/.local/bin:/Users/Rascal/.nvm/versions/node/v24.14.1/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>PYTHONUNBUFFERED</key>
+		<string>1</string>
+		<key>VIRTUAL_ENV</key>
+		<string>/Users/Rascal/.hermes-venv</string>
+	</dict>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>Label</key>
+	<string>local.jarvis.runtime</string>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/Rascal/.hermes-venv/bin/python</string>
+		<string>/Users/Rascal/AI-Lab/hermes-jarvis/bin/jarvis_runtime.py</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/Rascal/AI-Lab/hermes-jarvis/logs/runtime.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/Rascal/AI-Lab/hermes-jarvis/logs/runtime.out.log</string>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+</dict>
+</plist>

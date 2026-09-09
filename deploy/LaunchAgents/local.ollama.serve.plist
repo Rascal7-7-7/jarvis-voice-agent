@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Ollama server for the Hermes JARVIS brain.  Added 2026-08-29.
+
+  Why this exists: ~/.hermes/config.yaml now points model resolution at
+  http://127.0.0.1:11434/v1.  Without a supervised server that endpoint dies at
+  logout and Hermes is left configured against a dead brain.
+
+  Deliberately loopback-only (OLLAMA_HOST=127.0.0.1:11434) — no new
+  externally-reachable listener.
+
+  KeepAlive mirrors ai.hermes.gateway: restart only on abnormal exit, so a
+  clean stop stays stopped and there is no restart loop.
+
+  TO REMOVE:
+    launchctl unload ~/Library/LaunchAgents/local.ollama.serve.plist
+    mv ~/Library/LaunchAgents/local.ollama.serve.plist ~/local.ollama.serve.plist.disabled
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.ollama.serve</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/ollama</string>
+        <string>serve</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>OLLAMA_HOST</key>
+        <string>127.0.0.1:11434</string>
+        <key>OLLAMA_KEEP_ALIVE</key>
+        <string>10m</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/Rascal/AI-Lab/hermes-jarvis/logs/ollama.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/Rascal/AI-Lab/hermes-jarvis/logs/ollama.error.log</string>
+
+    <key>ProcessType</key>
+    <string>Adaptive</string>
+</dict>
+</plist>

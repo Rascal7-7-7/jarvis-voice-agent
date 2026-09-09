@@ -1,0 +1,24 @@
+# ── 上流の vendored リポジトリ（それ自体が git repo・317MB）
+# hermes-agent v2026.8.27 は上流の pin 済みコピー。JARVIS 固有のコードではないため
+# このリポジトリでは管理しない。差し替え時は版数を JOURNAL に記録すること。
+src/
+
+# ── ログ（発話・応答テキストを含む。§17 privacy: 0600/0700 を維持）
+logs/
+*.log
+
+# ── 音声・生成物
+*.wav
+tts-samples/
+
+# ── 退避コピー（.pre-* / .post-* は bin/ 直下にあり git 化後は履歴で代替できるが、
+#    FREEZE 中は現状保持のため追跡対象に残す。backups/ ディレクトリのみ除外）
+backups/
+
+# ── Python / エディタ
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.DS_Store

@@ -1,0 +1,324 @@
+"""JARVIS always-on runtime — background wake listener, no Terminal required.
+
+    launchd ──► this process ──► tools.wake_word detector (upstream)
+                                        │  "Hey Jarvis"
+                                        ▼
+                                 pause listener (releases the mic)
+                                        ▼
+                                 tools.voice_mode.AudioRecorder (upstream + the
+                                        │                        dynamic-mic patch)
+                                        ▼
+                                 transcribe_recording (upstream, faster-whisper)
+                                        ▼
+                                 jarvis_gate ─► jarvis_router ─► dispatch
+                                        ▼
+                                 speak_text (upstream TTS)
+                                        ▼
+                                 resume listener
+
+Everything except the loop itself is upstream API. `tools/` is not forked; the
+only local change to the Hermes tree remains the AudioRecorder device-follow
+patch from an earlier phase.
+
+WHY A DEDICATED PROCESS
+  The gateway hosts no wake listener. tui_gateway's `wake.start` is
+  client-driven — a connected transport calls it and owns it — so it is not a
+  headless host either. `hermes chat` needs the interactive TUI. A small
+  supervised process is the only shape that satisfies "no Terminal window".
+
+WHY NO .app HELPER
+  Measured on this machine: a launchd-started process using
+  ~/.hermes-venv/bin/python captured REAL audio 3/3 (peak 2498-3090,
+  3781-4137 distinct sample values). The Microphone grant follows the binary,
+  not the parent, so no bundle identity work is required.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SRC = os.path.expanduser("~/AI-Lab/hermes-jarvis/src/hermes-agent-v2026.8.27")
+sys.path.insert(0, SRC)
+sys.path.insert(0, HERE)
+
+LOG_DIR = os.path.expanduser("~/AI-Lab/hermes-jarvis/logs")
+STATE_PATH = os.path.join(LOG_DIR, "jarvis_state.json")
+LOCK_PATH = os.path.join(LOG_DIR, "jarvis_runtime.lock")
+MAX_LOG_BYTES = 5 * 1024 * 1024
+
+os.makedirs(LOG_DIR, exist_ok=True)
+logger = logging.getLogger("jarvis")
+
+
+# --------------------------------------------------------------------------- log
+def _setup_logging() -> None:
+    path = os.path.join(LOG_DIR, "jarvis_runtime.log")
+    # Size-capped by hand: launchd does not rotate, and an always-on listener
+    # would otherwise grow without bound.
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > MAX_LOG_BYTES:
+            os.replace(path, path + ".1")
+    except OSError:
+        pass
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[logging.FileHandler(path), logging.StreamHandler(sys.stdout)],
+    )
+
+
+# ------------------------------------------------------------------ single instance
+class SingleInstance:
+    """One runtime per machine. A stale lock from a killed process is reclaimed."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.fd = None
+
+    def __enter__(self):
+        import fcntl
+        self.fd = open(self.path, "w")
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self.fd.close()
+            raise RuntimeError("another jarvis_runtime already holds the lock")
+        self.fd.write(f"{os.getpid()}\n")
+        self.fd.flush()
+        return self
+
+    def __exit__(self, *exc):
+        import fcntl
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            self.fd.close()
+        except Exception:
+            pass
+
+
+# ------------------------------------------------------------------------- state
+_state_lock = threading.Lock()
+_state = {"state": "OFFLINE", "since": time.time(), "detail": ""}
+
+
+def set_state(name: str, detail: str = "") -> None:
+    """Publish the HUD state. A file, not a socket: the HUD is read-only and
+    must never be able to reach back into the runtime."""
+    with _state_lock:
+        _state.update(state=name, since=time.time(), detail=detail)
+        payload = dict(_state)
+    payload["pid"] = os.getpid()
+    tmp = STATE_PATH + ".tmp"
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        os.replace(tmp, STATE_PATH)
+    except OSError:
+        pass
+    logger.info("state=%s %s", name, detail)
+
+
+# -------------------------------------------------------------------------- main
+_stop = threading.Event()
+
+
+def _handle_signal(signum, _frame):
+    logger.info("signal %s — shutting down", signum)
+    _stop.set()
+
+
+def _dispatch(transcript: str) -> str:
+    """Gate -> route -> delegate. Returns what should be spoken."""
+    import jarvis_router
+
+    decision = jarvis_router.route(transcript)
+    route = decision["route"]
+    set_state("ROUTING", f"{route} via {decision['decided_by']}")
+    logger.info("route=%s by=%s cats=%s", route, decision["decided_by"],
+                decision.get("categories"))
+
+    if route == "CONFIRMATION_REQUIRED":
+        set_state("CONFIRMATION_REQUIRED", ",".join(decision.get("categories") or []))
+        cats = "・".join(decision.get("categories") or [])
+        # Speech only. Nothing is dispatched, nothing is executed.
+        return f"その操作は取り消せない可能性があります。{cats}に該当します。実行してよろしいですか？"
+
+    set_state(route, "working")
+    dispatch = os.path.join(HERE, "jarvis-dispatch")
+    try:
+        p = subprocess.run([dispatch, transcript], capture_output=True, text=True,
+                           timeout=300)
+        out = (p.stdout or "").strip()
+        return out or "うまく応答できませんでした。"
+    except subprocess.TimeoutExpired:
+        return "処理に時間がかかりすぎたため中断しました。"
+    except Exception as e:
+        logger.exception("dispatch failed")
+        return f"内部エラーが発生しました。{type(e).__name__}"
+
+
+def _handle_wake(recorder_box: dict) -> None:
+    from hermes_cli import voice as hvoice
+    from tools import voice_mode as vm
+    from tools import wake_word as ww
+
+    owner = recorder_box["owner"]
+    try:
+        if not ww.pause_listening(owner=owner):
+            logger.warning("wake fired but the listener lease was not ours")
+            return
+
+        set_state("LISTENING", "capturing utterance")
+        rec = recorder_box.get("rec")
+        if rec is None:
+            rec = vm.AudioRecorder()
+            recorder_box["rec"] = rec
+
+        done = threading.Event()
+        rec.start(on_silence_stop=done.set)
+        # VAD auto-stop, with a hard ceiling so a stuck stream cannot hold the
+        # mic forever.
+        done.wait(timeout=30)
+        wav = rec.stop()
+        if not wav:
+            set_state("IDLE", "no speech")
+            return
+
+        set_state("THINKING", "transcribing")
+        res = vm.transcribe_recording(wav)
+        transcript = (res.get("transcript") or "").strip() if isinstance(res, dict) else ""
+        logger.info("transcript=%r", transcript)
+        if not transcript:
+            set_state("IDLE", "empty transcript")
+            return
+
+        reply = _dispatch(transcript)
+        set_state("SPEAKING", reply[:60])
+        try:
+            hvoice.speak_text(reply)
+        except Exception:
+            logger.exception("TTS failed")
+    finally:
+        try:
+            ww.resume_listening(owner=recorder_box["owner"])
+        except Exception:
+            logger.exception("failed to resume the wake listener")
+        set_state("IDLE", "waiting for wake word")
+
+
+def main() -> int:
+    _setup_logging()
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
+    set_state("OFFLINE", "starting")
+
+    from tools import wake_word as ww
+
+    cfg = ww.load_wake_word_config()
+    if not cfg.get("enabled"):
+        logger.error("wake_word.enabled is false — nothing to do")
+        set_state("OFFLINE", "wake word disabled in config")
+        return 78
+
+    owner = object()
+    box = {"owner": owner, "rec": None}
+    inflight = threading.Lock()
+
+    def on_wake():
+        # The detector fires from its own thread; never block it.
+        if not inflight.acquire(blocking=False):
+            logger.info("wake ignored — a turn is already in flight")
+            return
+        def run():
+            try:
+                _handle_wake(box)
+            finally:
+                inflight.release()
+        threading.Thread(target=run, daemon=True).start()
+
+    # The wake microphone is a MACHINE-WIDE lease (~/.hermes/runtime/wake-word.lock).
+    # An interactive `hermes chat` claims it too, so the runtime must not die when
+    # the user happens to have a session open — under launchd that would be a
+    # crash loop. Wait for the lease instead, and take over the moment it frees.
+    detector = None
+    backoff = 5.0
+    while detector is None and not _stop.is_set():
+        try:
+            detector = ww.start_listening(on_wake, owner=owner, config=cfg)
+        except ww.WakeWordInUse:
+            set_state("OFFLINE", "wake mic owned by another surface (hermes chat?) — waiting")
+            logger.info("wake mic already owned; retrying in %.0fs", backoff)
+            _stop.wait(backoff)
+            backoff = min(backoff * 1.5, 60.0)
+        except Exception as e:
+            set_state("ERROR", f"listener start failed: {type(e).__name__}")
+            logger.exception("failed to start the wake listener; retrying in %.0fs", backoff)
+            _stop.wait(backoff)
+            backoff = min(backoff * 1.5, 60.0)
+    if detector is None:
+        set_state("OFFLINE", "stopped before acquiring the wake mic")
+        return 0
+    d = detector.input_device_details or {}
+    logger.info("wake listener up: device=%r rate=%s phrase=%r provider=%s",
+                d.get("name"), d.get("default_samplerate"),
+                cfg.get("phrase"), cfg.get("provider"))
+    set_state("IDLE", f"listening on {d.get('name')}")
+
+    # Health watchdog. Upstream already flags a stream that delivers only
+    # silence (audio_silent after ~10 s); after a sleep/wake the CoreAudio
+    # handle can survive as a live-but-dead stream, which looks exactly like
+    # that. Restarting the listener re-resolves the default device too.
+    last_restart = 0.0
+    while not _stop.is_set():
+        _stop.wait(5.0)
+        if _stop.is_set():
+            break
+        try:
+            if getattr(detector, "audio_silent", False) and not inflight.locked():
+                now = time.time()
+                if now - last_restart > 60:
+                    logger.warning("listener reports silence — restarting it")
+                    set_state("ERROR", "mic silent; restarting listener")
+                    last_restart = now
+                    try:
+                        detector.pause()
+                        time.sleep(0.5)
+                        detector.resume()
+                        d = detector.input_device_details or {}
+                        logger.info("listener restarted on device=%r", d.get("name"))
+                        set_state("IDLE", f"listening on {d.get('name')}")
+                    except Exception:
+                        logger.exception("listener restart failed")
+        except Exception:
+            logger.exception("watchdog error")
+
+    logger.info("stopping")
+    try:
+        ww.stop_listening(owner=owner)
+    except Exception:
+        pass
+    rec = box.get("rec")
+    if rec is not None:
+        try:
+            rec.shutdown()
+        except Exception:
+            pass
+    set_state("OFFLINE", "stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        with SingleInstance(LOCK_PATH):
+            sys.exit(main())
+    except RuntimeError as e:
+        print(f"jarvis_runtime: {e}", file=sys.stderr)
+        sys.exit(75)

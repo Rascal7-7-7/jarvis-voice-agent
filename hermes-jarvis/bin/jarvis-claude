@@ -1,0 +1,103 @@
+#!/bin/zsh
+# jarvis-claude — fixed-argv Claude Code delegation for Hermes JARVIS.
+#
+# WHY THE ABSOLUTE WRAPPER PATH IS MANDATORY:
+#   ~/.local/bin/claude is a launcher that injects
+#   CLAUDE_CONFIG_DIR=$HOME/.claude-work before exec'ing the real CLI. A bare
+#   `claude` resolved from a launchd/cron PATH falls through to the default
+#   root ~/.claude, whose settings.json registers a different hook set and does
+#   NOT carry the 17 deny rules. Delegation must never take that path, so the
+#   wrapper path is pinned here and VERIFIED at run time — this script fails
+#   closed if the config root is not ~/.claude-work.
+#
+# READ-ONLY: --permission-mode plan is hardcoded. Plan mode cannot edit files.
+# There is no write mode in this script.
+#
+# WHY THE TIMEOUT: a delegated analysis must not be able to hang a voice turn.
+
+set -u
+emulate -L zsh
+
+CLAUDE_WRAPPER="${JARVIS_CLAUDE_BIN:-$HOME/.local/bin/claude}"
+TIMEOUT="${JARVIS_CLAUDE_TIMEOUT:-180}"
+EXPECTED_ROOT="$HOME/.claude-work"
+
+ALLOWED_ROOTS=(
+  "$HOME/AI-Lab/hermes-jarvis"
+  "$HOME/work"
+)
+
+usage() { print -u2 "usage: jarvis-claude <directory> <prompt...>"; exit 64 }
+[[ $# -ge 2 ]] || usage
+
+TARGET_DIR="${1:A}"
+shift
+PROMPT="$*"
+
+[[ -d "$TARGET_DIR" ]] || { print -u2 "jarvis-claude: not a directory: $TARGET_DIR"; exit 66 }
+
+allowed=0
+for root in $ALLOWED_ROOTS; do
+  if [[ "$TARGET_DIR" == "${root:A}" || "$TARGET_DIR" == "${root:A}"/* ]]; then allowed=1; break; fi
+done
+if (( ! allowed )); then
+  print -u2 "jarvis-claude: refused — $TARGET_DIR is outside the allowlist"
+  print -u2 "  allowed roots: $ALLOWED_ROOTS"
+  exit 77
+fi
+
+[[ -x "$CLAUDE_WRAPPER" ]] || { print -u2 "jarvis-claude: wrapper not executable at $CLAUDE_WRAPPER"; exit 69 }
+
+# ---- FAIL CLOSED: prove the wrapper lands on the right config root ----------
+selftest=$(CLAUDE_LAUNCHER_SELFTEST=1 "$CLAUDE_WRAPPER" 2>&1) || {
+  print -u2 "jarvis-claude: wrapper selftest failed"; exit 69
+}
+child_root=$(print -r -- "$selftest" | sed -n 's/^CHILD_CLAUDE_CONFIG_DIR=//p')
+recursion=$(print -r -- "$selftest" | sed -n 's/^RECURSION=//p')
+if [[ "$child_root" != "$EXPECTED_ROOT" ]]; then
+  print -u2 "jarvis-claude: REFUSED — config root would be '$child_root', expected '$EXPECTED_ROOT'."
+  print -u2 "  Delegating here would run Claude without the ~/.claude-work deny rules."
+  exit 78
+fi
+if [[ "$recursion" != "no" ]]; then
+  print -u2 "jarvis-claude: REFUSED — wrapper reports RECURSION=$recursion"; exit 78
+fi
+
+"$HOME/.hermes-venv/bin/python" - "$CLAUDE_WRAPPER" "$TARGET_DIR" "$TIMEOUT" "$PROMPT" <<'PYEOF'
+import os, signal, subprocess, sys, time
+
+wrapper, target_dir, timeout_s, prompt = sys.argv[1:5]
+cmd = [
+    wrapper,
+    "-p",                                # non-interactive print mode
+    "--permission-mode", "plan",         # pinned: plan mode cannot edit files
+    prompt,
+]
+t0 = time.time()
+p = subprocess.Popen(cmd, cwd=target_dir, stdout=subprocess.PIPE,
+                     stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                     text=True, preexec_fn=os.setsid)
+try:
+    out, err = p.communicate(timeout=float(timeout_s))
+    rc = p.returncode
+except subprocess.TimeoutExpired:
+    os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+    try:
+        out, err = p.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        out, err = "", ""
+    print(f"CLAUDE_TIMEOUT after {timeout_s}s — Claudeを利用できませんでした（応答なし）",
+          file=sys.stderr)
+    sys.exit(75)
+
+dt = time.time() - t0
+if rc != 0:
+    tail = "\n".join((err or out or "").strip().splitlines()[-6:])
+    print(f"CLAUDE_ERROR exit={rc} after {dt:.1f}s\n{tail}", file=sys.stderr)
+    sys.exit(70)
+
+print((out or "").strip())
+print(f"\n[jarvis-claude: permission-mode=plan config_root=~/.claude-work wall={dt:.1f}s]",
+      file=sys.stderr)
+PYEOF

@@ -1,0 +1,3 @@
+FAILED tests/test_stats.py::test_mean_empty - ZeroDivisionError: division by zero
+FAILED tests/test_stats.py::test_percentile_max - IndexError: list index out of range
+2 failed, 8 passed in 0.31s

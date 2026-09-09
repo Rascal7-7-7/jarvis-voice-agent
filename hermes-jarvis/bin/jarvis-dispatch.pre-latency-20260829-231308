@@ -1,0 +1,90 @@
+#!/bin/zsh
+# jarvis-dispatch — one utterance in, one voice-sized answer out.
+#
+#   utterance
+#     -> jarvis_router (deterministic gate -> override -> fast path -> LLM)
+#     -> LOCAL  : Hermes local brain
+#        WEB    : Hermes + web tools
+#        CODEX  : jarvis-codex   (read-only sandbox, hard timeout)
+#        CLAUDE : jarvis-claude  (plan mode, config-root verified)
+#        CONFIRMATION_REQUIRED : STOP. Ask the human. Never dispatch.
+#
+# C8: the reply is kept short enough to speak. Codex/Claude raw output is NOT
+# read aloud verbatim — it is summarised to a conclusion plus an offer to read
+# the detail, because a HUD will carry the detail later.
+
+set -u
+emulate -L zsh
+
+BIN="${0:A:h}"
+PY="$HOME/.hermes-venv/bin/python"
+WORKDIR="${JARVIS_WORKDIR:-$HOME/AI-Lab/hermes-jarvis/fixtures/codex-readonly}"
+
+[[ $# -ge 1 ]] || { print -u2 "usage: jarvis-dispatch <utterance>"; exit 64 }
+UTTERANCE="$*"
+
+decision=$("$PY" "$BIN/jarvis_router.py" "$UTTERANCE") || {
+  print -u2 "jarvis-dispatch: router failed"; exit 70
+}
+route=$("$PY" -c 'import json,sys;print(json.loads(sys.stdin.read())["route"])' <<< "$decision")
+by=$("$PY" -c 'import json,sys;print(json.loads(sys.stdin.read())["decided_by"])' <<< "$decision")
+cats=$("$PY" -c 'import json,sys;d=json.loads(sys.stdin.read());print(",".join(d.get("categories") or []))' <<< "$decision")
+
+print -u2 "[route=$route by=$by${cats:+ categories=$cats}]"
+
+case "$route" in
+  CONFIRMATION_REQUIRED)
+    # Deliberately produces SPEECH ONLY. No tool, no delegation, no execution.
+    print "その操作は取り消せない可能性があります（${cats}）。実行してよろしいですか？"
+    exit 0
+    ;;
+  CODEX)
+    out=$("$BIN/jarvis-codex" "$WORKDIR" "$UTTERANCE 日本語で簡潔に。" 2>/dev/null) || {
+      print "Codexを利用できませんでした。"; exit 0
+    }
+    ;;
+  CLAUDE)
+    out=$("$BIN/jarvis-claude" "$WORKDIR" "$UTTERANCE 日本語で簡潔に。" 2>/dev/null) || {
+      print "Claudeを利用できませんでした。"; exit 0
+    }
+    ;;
+  WEB|LOCAL)
+    out=$(cd "$WORKDIR" && "$HOME/.local/bin/hermes" -z "$UTTERANCE" 2>/dev/null) || {
+      print "ローカルで応答できませんでした。"; exit 0
+    }
+    print -r -- "$out"
+    exit 0
+    ;;
+  *)
+    print "うまく判断できませんでした。もう一度お願いします。"
+    exit 0
+    ;;
+esac
+
+# ---- C8: shrink a delegated answer to something speakable -------------------
+"$PY" - "$route" <<PYEOF
+import json, sys, urllib.request
+route = sys.argv[1]
+detail = """$out"""
+body = {
+    "model": "gemma4:e2b",
+    "messages": [
+        {"role": "system", "content":
+         "あなたはJarvis。渡された調査結果を、音声で読み上げる用に日本語2文以内へ要約します。"
+         "結論を先に言い、箇条書き・記号・コードは使いません。"
+         "最後に「詳細も読み上げますか？」と付け加えます。"},
+        {"role": "user", "content": detail[:4000]},
+    ],
+    "max_tokens": 220, "temperature": 0, "reasoning_effort": "none",
+}
+req = urllib.request.Request("http://127.0.0.1:11434/v1/chat/completions",
+                             data=json.dumps(body).encode(),
+                             headers={"Content-Type": "application/json"})
+try:
+    d = json.load(urllib.request.urlopen(req, timeout=30))
+    said = (d["choices"][0]["message"].get("content") or "").strip()
+except Exception:
+    said = ""
+print(said or (detail.strip().splitlines() or ["結果を取得しました。"])[0][:160])
+print(f"\n--- {route} full output ({len(detail)} chars) kept for the HUD ---", file=sys.stderr)
+PYEOF

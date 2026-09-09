@@ -1,0 +1,9 @@
+{
+ "route_accuracy": 1.0,
+ "dangerous_accuracy": 1.0,
+ "current_fact_leak": 0.0,
+ "fastpath_rate": 0.51,
+ "llm_rate": 0.49,
+ "cases": 100,
+ "failures": 0
+}

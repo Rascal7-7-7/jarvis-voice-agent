@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>local.jarvis.watchdog</string>
+
+	<!-- System python3, stdlib only. Deliberately NOT ~/.hermes-venv: the
+	     watchdog must not depend on the environment it exists to rescue. -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/python3</string>
+		<string>/Users/Rascal/AI-Lab/jarvis-watchdog/bin/jarvis_watchdog.py</string>
+	</array>
+
+	<!-- Long-lived, not StartInterval. Elapsed LISTENING time is tracked on a
+	     monotonic clock inside the process, which a per-poll process could not
+	     do without persisting time to disk and reintroducing wall-clock bugs. -->
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+
+	<!-- Interactive, not Background. Measured on this machine: Background and
+	     Adaptive both land at PRI 4 and get starved hard under load (19x on a
+	     CPU-bound task). The watchdog does almost nothing -- a stat and a small
+	     read every 5s -- so the priority costs nothing, but being descheduled
+	     exactly when the machine is struggling is the one thing a fail-safe
+	     must not do. Also keeps it out of Low Power Mode throttling. -->
+	<key>ProcessType</key>
+	<string>Interactive</string>
+
+	<key>StandardOutPath</key>
+	<string>/Users/Rascal/AI-Lab/jarvis-watchdog/logs/stdout.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/Rascal/AI-Lab/jarvis-watchdog/logs/stderr.log</string>
+
+	<key>WorkingDirectory</key>
+	<string>/Users/Rascal/AI-Lab/jarvis-watchdog</string>
+</dict>
+</plist>

@@ -1,0 +1,47 @@
+# ─────────────────────────────────────────────────────────────
+# JARVIS_project — 許可リスト方式
+# ~/AI-Lab には 40GB 超の無関係な資産（ベンチマーク・モデル・codex 実験）があるため、
+# まず全部を無視し、JARVIS スタックだけを明示的に戻す。
+# ─────────────────────────────────────────────────────────────
+/*
+!/.gitignore
+!/README.md
+!/deploy/
+!/hermes-jarvis/
+!/jarvis-watchdog/
+!/jarvis-hud/
+!/jarvis-hotkey/
+!/jarvis-ack-helper/
+!/jarvis-activate/
+!/jarvis-validation-evidence/
+
+# ── hermes-jarvis 内の除外
+# src/ は上流 hermes-agent v2026.8.27 の pin 済みコピーで、それ自体が git repo（317MB）。
+# RC1 manifest はこの配下の 2 ファイルを含むため、扱いは deploy/UPSTREAM_PINS.md に記録する。
+hermes-jarvis/src/
+hermes-jarvis/logs/
+hermes-jarvis/backups/
+hermes-jarvis/tts-samples/
+
+# ── ビルド生成物（manifest には .app バイナリが含まれるが、git にバイナリは入れない。
+#    ソースを追跡し、バイナリの同一性は SHA manifest 側で担保する）
+**/.build/
+**/DerivedData/
+**/dist/
+**/*.xcodeproj/xcuserdata/
+
+# ── ログ（発話・応答テキストを含む。§17 privacy）
+**/logs/
+*.log
+
+# ── 音声・生成物
+*.wav
+*.mp3
+*.aiff
+
+# ── Python / エディタ
+**/__pycache__/
+*.py[cod]
+**/.venv/
+**/.pytest_cache/
+.DS_Store

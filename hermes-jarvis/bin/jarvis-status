@@ -1,0 +1,19 @@
+#!/bin/sh
+# jarvis-status — read-only health check for the always-on JARVIS stack.
+#
+# Nothing here is on PATH yet. To install it for interactive use, run ONE of:
+#
+#   ln -s ~/AI-Lab/hermes-jarvis/bin/jarvis-status ~/.local/bin/jarvis-status
+#   alias jarvis-status='~/AI-Lab/hermes-jarvis/bin/jarvis-status'   # in ~/.zshrc
+#
+# The venv is preferred only for a consistent interpreter; the checker itself
+# is pure stdlib, so the python3 fallback works the same.
+set -eu
+
+VENV_PYTHON="$HOME/.hermes-venv/bin/python"
+SCRIPT="$HOME/AI-Lab/hermes-jarvis/tools/jarvis_status.py"
+
+if [ -x "$VENV_PYTHON" ]; then
+    exec "$VENV_PYTHON" "$SCRIPT" "$@"
+fi
+exec python3 "$SCRIPT" "$@"

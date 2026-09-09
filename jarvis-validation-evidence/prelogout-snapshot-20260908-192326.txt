@@ -1,0 +1,64 @@
+# JARVIS pre-logout snapshot  2026-09-08 19:23:26 JST
+## uptime
+19:23  up 12 days, 21:06, 2 users, load averages: 4.19 4.74 5.80
+## jarvis-status
+JARVIS STATUS — FAIL
+
+Runtime            ✓ PID 91207
+Watchdog           ✓ PID 94818
+HUD                ✗ not running
+Hotkey             ✓ PID 94910
+Ollama             ✓ PID 14732
+Gateway            ✓ PID 94835
+State              ✓ IDLE / v2
+Wake lease         ✓ runtime (PID 91207)
+Socket             ✓ 0600
+Privacy            ✓ 0600 state / 0700 dirs
+Audio              ✓ PA 1/1 / repl 0 / err 0
+Startup warm       ✓ gemma4:e2b warm in 2.84s, ready after 1 attempt(s)
+Ollama API         ! ready / gemma4:e2b installed but not resident (next turn pays the load)
+Hermes             ✓ ready (/health)
+Watchdog log       ✓ 0 restarts, last seen 2026-09-08 18:04:37
+HUD login item     ! no launchd application job — registration unknown
+Hotkey login item  ✓ registered, running (PID 94910)
+
+Known gaps: 4
+  - WAKE_WORD_RELIABILITY = TUNING_PENDING
+  - CLAMSHELL_RECOVERY = UNVERIFIED
+  - REAL_LOGIN_WARM_VALIDATION = PENDING
+  - EARLY_TURN_DURING_WARM = UNVERIFIED
+## launchctl jobs
+94910	0	application.local.jarvis.hotkey.41506973.41507180
+94818	0	local.jarvis.watchdog
+91207	-9	local.jarvis.runtime
+## processes
+366 /usr/libexec/watchdogd
+12540 /Applications/Docker.app/Contents/MacOS/com.docker.virtualization --kernel /Applications/Docker.app/Contents/Resources/linuxkit/kernel --cmdline init=/initd loglevel=1 root=/dev/vdb rootfstype=erofs ro vsyscall=emulate panic=0 eth0.dhcp eth1.dhcp linuxkit.unified_cgroup_hierarchy=1 console=hvc0   virtio_net.disable_csum=1 vpnkit.connect=connect://2/1999 --boot /Applications/Docker.app/Contents/Resources/linuxkit/desktop.img --disk /Users/Rascal/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw --networkType gvisor --cpus 10 --memoryMiB 8192 --console-log /Users/Rascal/Library/Containers/com.docker.docker/Data/log/vm/console.log --watchdog --virtiofs /Users --virtiofs /Volumes --virtiofs /private --virtiofs /tmp --virtiofs /var/folders --rosetta
+14732 /opt/homebrew/bin/ollama serve
+91207 /Users/Rascal/.hermes-venv/bin/python /Users/Rascal/AI-Lab/hermes-jarvis/bin/jarvis_runtime.py
+94818 /Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python /Users/Rascal/AI-Lab/jarvis-watchdog/bin/jarvis_watchdog.py
+94910 /Users/Rascal/Applications/JARVIS Hotkey.app/Contents/MacOS/JarvisHotkey
+96820 node /Users/Rascal/work/automation/x/brave-watchdog.js namespace=default
+## RC1 manifest
+zoxide: detected a possible configuration issue.
+Please ensure that zoxide is initialized right at the end of your shell configuration file (usually ~/.zshrc).
+
+If the issue persists, consider filing an issue at:
+https://github.com/ajeetdsouza/zoxide/issues
+
+Disable this message by setting _ZO_DOCTOR=0.
+
+OK count: 25
+## runtime SHA
+cc212b9923e189359040d9374f09efa75a9ca6fac635e5c8aab2e6be5c08ab4e  /Users/Rascal/AI-Lab/hermes-jarvis/bin/jarvis_runtime.py
+## last 6 capture turns
+2026-09-07 21:33:39,770 INFO jarvis: capture TURN=1 silence_cb_fired=True FRAMES=751 PEAK_RMS=134 wav=False {'PA_OPEN_COUNT': 1, 'PA_START_COUNT': 1, 'stream_active': True, 'idle_chunks': 57855, 'idle_frames': 29621760, 'engine_frames_fed': 7714, 'feed_errors': 0, 'replacements': 0, 'wake_feed_enabled': False, 'wake_feed_gated_frames': 0, 'gate_engagements': 1}
+2026-09-07 21:49:19,514 INFO jarvis: capture TURN=2 silence_cb_fired=True FRAMES=751 PEAK_RMS=127 wav=False {'PA_OPEN_COUNT': 1, 'PA_START_COUNT': 1, 'stream_active': True, 'idle_chunks': 145155, 'idle_frames': 74319360, 'engine_frames_fed': 19347, 'feed_errors': 0, 'replacements': 0, 'wake_feed_enabled': False, 'wake_feed_gated_frames': 6, 'gate_engagements': 2}
+2026-09-08 16:58:25,186 INFO jarvis: capture TURN=3 silence_cb_fired=False FRAMES=2814 PEAK_RMS=1764 wav=True {'PA_OPEN_COUNT': 1, 'PA_START_COUNT': 1, 'stream_active': True, 'idle_chunks': 6599284, 'idle_frames': 3378833408, 'engine_frames_fed': 879890, 'feed_errors': 0, 'replacements': 0, 'wake_feed_enabled': False, 'wake_feed_gated_frames': 13, 'gate_engagements': 3}
+2026-09-08 17:09:56,893 INFO jarvis: capture TURN=4 silence_cb_fired=True FRAMES=213 PEAK_RMS=1446 wav=True {'PA_OPEN_COUNT': 1, 'PA_START_COUNT': 1, 'stream_active': True, 'idle_chunks': 6663829, 'idle_frames': 3411880448, 'engine_frames_fed': 886697, 'feed_errors': 0, 'replacements': 0, 'wake_feed_enabled': False, 'wake_feed_gated_frames': 1812, 'gate_engagements': 4}
+2026-09-08 17:12:04,203 INFO jarvis: capture TURN=5 silence_cb_fired=True FRAMES=946 PEAK_RMS=1593 wav=True {'PA_OPEN_COUNT': 1, 'PA_START_COUNT': 1, 'stream_active': True, 'idle_chunks': 6674800, 'idle_frames': 3417497600, 'engine_frames_fed': 888141, 'feed_errors': 0, 'replacements': 0, 'wake_feed_enabled': False, 'wake_feed_gated_frames': 1830, 'gate_engagements': 5}
+2026-09-08 18:03:29,307 INFO jarvis: capture TURN=6 silence_cb_fired=False FRAMES=2813 PEAK_RMS=1576 wav=True {'PA_OPEN_COUNT': 1, 'PA_START_COUNT': 1, 'stream_active': True, 'idle_chunks': 6960474, 'idle_frames': 3563762688, 'engine_frames_fed': 925834, 'feed_errors': 0, 'replacements': 0, 'wake_feed_enabled': False, 'wake_feed_gated_frames': 2226, 'gate_engagements': 6}
+## last counters
+{'PA_OPEN_COUNT': 1, 'PA_START_COUNT': 1, 'stream_active': True, 'idle_chunks': 6960474, 'idle_frames': 3563762688, 'engine_frames_fed': 925834, 'feed_errors': 0, 'replacements': 0, 'wake_feed_enabled': False, 'wake_feed_gated_frames': 2226, 'gate_engagements': 6}
+## PRE_FIX reference
+backend=17866ms  first_audio=26124ms

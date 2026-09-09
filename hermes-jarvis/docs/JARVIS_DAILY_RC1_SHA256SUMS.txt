@@ -1,0 +1,39 @@
+# JARVIS_DAILY_RC1_20260902 — authoritative SHA256 manifest
+# Generated 2026-09-02 14:07:41 JST on jET-consulting
+# Verify with:  shasum -a 256 -c docs/JARVIS_DAILY_RC1_SHA256SUMS.txt
+# (run from ~ — paths below are relative to the home directory)
+#
+## runtime (hermes-jarvis)
+cc212b9923e189359040d9374f09efa75a9ca6fac635e5c8aab2e6be5c08ab4e  AI-Lab/hermes-jarvis/bin/jarvis_runtime.py
+49213b6c01947a365c49ae6e1f457145d1747b534c3a23f8907573dc4bec4912  AI-Lab/hermes-jarvis/bin/shared_audio.py
+b15698825d5fa64861f25c8325501f6787f1e4efc5c2e1d5f7ba4d423ba3a81e  AI-Lab/hermes-jarvis/bin/activation_socket.py
+59d5ec3df0be2b8802016e500478396d3816441298790c7d7ed7701976b90741  AI-Lab/hermes-jarvis/bin/jarvis_router.py
+b89bcc3c6a5a1a671d6a912f3c3cb3aa9323f19756bb3cc399b46e6fa19af539  AI-Lab/hermes-jarvis/bin/jarvis_local_fast.py
+4b1a7dde4730aab29d20d754c3b79fe045ac19548124bf8965d43a2f601f188c  AI-Lab/hermes-jarvis/bin/jarvis_gate.py
+e5978a2d4af62962cbd6b7fec8d50457b86188285310e5d42b2b3dcf21212a93  AI-Lab/hermes-jarvis/bin/jarvis_profiles.py
+f6e3357c81fd31bb17169507a464a9d89d10dd638ee0628807f7eac2f3788966  AI-Lab/hermes-jarvis/bin/jarvis-dispatch
+af40cf57dfb51ca9e9744d928442fa30a4afd5191b31817b3db12c5c3c8006f6  AI-Lab/hermes-jarvis/bin/jarvis-status
+ae8a60b8ed6c4e29f8940d271d393ed30db17c13511476e34dc78784f4537d4b  AI-Lab/hermes-jarvis/tools/jarvis_status.py
+d4f1c7e606ff1f0454ad14b53e5e6d3aa4ca330fc8ea627c3510c2d411e86d3b  AI-Lab/hermes-jarvis/tools/jarvis_status_checks.py
+c49037d611a36a3463dc437720f30c194b0b57d400fc4f6fdf8ce055aec59e27  AI-Lab/hermes-jarvis/config/known_gaps.json
+#
+## upstream hermes tools (unforked except the AudioRecorder device-follow patch)
+0d39b668217e92f8f5189dd45b40b9f99ce950c8a898316b7d50b091b201b399  AI-Lab/hermes-jarvis/src/hermes-agent-v2026.8.27/tools/wake_word.py
+7cfc1e4d251a20fb3681d6054545da6237ec9bb91cd9413d43771de7aece1410  AI-Lab/hermes-jarvis/src/hermes-agent-v2026.8.27/tools/voice_mode.py
+#
+## watchdog
+23ed23fc41ff840cb3b88701e74dd3108baa6962323f6c3de4e3f220a1c89771  AI-Lab/jarvis-watchdog/bin/jarvis_watchdog.py
+e2d972ef5d3f085d8e49bcca834ff5956ab26dafcf6d71711b87da9fb0661668  AI-Lab/jarvis-watchdog/src/watchdog_core.py
+396a3e421079f98c74824ded21eecad3583265f892dca66820e131bf31d4a5c9  AI-Lab/jarvis-watchdog/src/state_reader.py
+4d6e787b68a42129dd6a7a2442d41779797edda177aead1d6377c62d3ce44c31  AI-Lab/jarvis-watchdog/src/restarter.py
+8861547ff88ab0dfbb199a398c35ce6ec3b43e60e0d5224d8eb3ece767d98ed9  AI-Lab/jarvis-watchdog/src/wlog.py
+#
+## installed app bundles (login items)
+441f9ed6689ab597f16929e2716d6df54cb10440c7245b6e7603393a63f76c79  Applications/JARVIS HUD.app/Contents/MacOS/JarvisHUD
+f1d009da6c91906cf054f0db2a389a659bc8ffcdfca058d809af7dda4c02f925  Applications/JARVIS Hotkey.app/Contents/MacOS/JarvisHotkey
+#
+## LaunchAgents
+0a921de5ae30752972da0c41d0b1740e284732f1f592d89c5471ace0b43bf879  Library/LaunchAgents/local.jarvis.runtime.plist
+a4ea2e34df413368533bdfdd598b85005cf64e3ee68981735f50968ec4e84b1e  Library/LaunchAgents/local.jarvis.watchdog.plist
+c923df9bf678e0a87d6b0afd62d94b27d70dfc32db4120f4bfb6be9717501bfd  Library/LaunchAgents/local.ollama.serve.plist
+3f50128d23649904f1723d0f477fa3550916819380e1c75dd54461b80ec8ae04  Library/LaunchAgents/ai.hermes.gateway.plist

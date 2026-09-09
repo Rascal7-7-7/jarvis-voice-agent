@@ -1,0 +1,1276 @@
+"""JARVIS always-on runtime — background wake listener, no Terminal required.
+
+    launchd ──► this process ──► tools.wake_word detector (upstream)
+                                        │  "Hey Jarvis"
+                                        ▼
+                                 pause listener (releases the mic)
+                                        ▼
+                                 tools.voice_mode.AudioRecorder (upstream + the
+                                        │                        dynamic-mic patch)
+                                        ▼
+                                 transcribe_recording (upstream, faster-whisper)
+                                        ▼
+                                 jarvis_gate ─► jarvis_router ─► dispatch
+                                        ▼
+                                 speak_text (upstream TTS)
+                                        ▼
+                                 resume listener
+
+Everything except the loop itself is upstream API. `tools/` is not forked; the
+only local change to the Hermes tree remains the AudioRecorder device-follow
+patch from an earlier phase.
+
+WHY A DEDICATED PROCESS
+  The gateway hosts no wake listener. tui_gateway's `wake.start` is
+  client-driven — a connected transport calls it and owns it — so it is not a
+  headless host either. `hermes chat` needs the interactive TUI. A small
+  supervised process is the only shape that satisfies "no Terminal window".
+
+WHY NO .app HELPER
+  Measured on this machine: a launchd-started process using
+  ~/.hermes-venv/bin/python captured REAL audio 3/3 (peak 2498-3090,
+  3781-4137 distinct sample values). The Microphone grant follows the binary,
+  not the parent, so no bundle identity work is required.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SRC = os.path.expanduser("~/AI-Lab/hermes-jarvis/src/hermes-agent-v2026.8.27")
+sys.path.insert(0, SRC)
+sys.path.insert(0, HERE)
+
+LOG_DIR = os.path.expanduser("~/AI-Lab/hermes-jarvis/logs")
+STATE_PATH = os.path.join(LOG_DIR, "jarvis_state.json")
+LOCK_PATH = os.path.join(LOG_DIR, "jarvis_runtime.lock")
+MAX_LOG_BYTES = 5 * 1024 * 1024
+
+OLLAMA_URL = "http://127.0.0.1:11434"
+ROUTER_MODEL = "gemma4:e2b"
+# How long Ollama keeps gemma4:e2b resident after each use. Renewed every turn,
+# so it stays loaded while JARVIS is in use and releases its 7.23 GB an hour
+# after the last one -- which matters on a 32 GB machine shared with Claude and
+# Codex. Set per request; the Ollama LaunchAgent's OLLAMA_KEEP_ALIVE=10m is not
+# touched, so nothing else on this machine changes behaviour.
+KEEP_ALIVE = os.environ.get("JARVIS_KEEP_ALIVE", "60m")
+
+# Startup readiness, for the warm only. Ollama and this runtime are separate
+# LaunchAgents with no ordering between them, so at login the startup warm can
+# reach 127.0.0.1:11434 before `ollama serve` is listening. Measured 2026-09-02:
+#   12:10:51  ollama warm (startup) failed: URLError    <- connection refused
+# and, with no retry, the model stayed cold until the first real turn paid the
+# load itself: LOCAL_FAST 17,866 ms against 3,878-4,214 ms on warm turns of the
+# same route, i.e. a ~14 s penalty on the first utterance after every login.
+# urlopen's timeout was never the problem -- a refused connection fails at once,
+# so a longer timeout would still have failed at once. What was missing is a
+# retry that waits for the port to come up.
+OLLAMA_READY_PATH = "/api/tags"
+# Per-probe, not per-budget: a probe that hangs must not eat the whole budget.
+READY_PROBE_TIMEOUT = 2.0
+# Backoff between probes; the last value repeats until the budget is spent.
+READY_BACKOFF = (1.0, 2.0, 3.0, 5.0)
+# Bounded on purpose. If Ollama is not coming up, the worker gives up and the
+# runtime carries on -- LOCAL_FAST then pays a cold load on its first turn,
+# which is exactly today's behaviour and strictly better than a retry loop
+# against a service that is never going to answer.
+READY_BUDGET = 45.0
+
+# Measured on this machine, 2026-08-29, from the first real background turn:
+#   capture 15.65 s = 11.74 s of the user not speaking yet
+#                   + 0.72 s of speech
+#                   + 3.01 s of silence  (voice.silence_duration = 3.0)
+# The recorder behaved exactly as configured; 3.0 s is simply a long tail to pay
+# on every turn. These two overrides are set on the RUNTIME'S OWN AudioRecorder
+# instance only -- ~/.hermes/config.yaml is untouched, so `hermes chat` and
+# Ctrl+B push-to-talk keep the original 3.0 s. The RMS threshold is deliberately
+# NOT touched: that is voice sensitivity, and the measurement showed it was
+# never the problem (speech peaked at 4413 against a 47 noise floor).
+SILENCE_DURATION_SECONDS = 1.2
+# How long to wait for the user to start talking at all before giving up. The
+# upstream default lets a silent turn run for the full recording cap.
+MAX_WAIT_FOR_SPEECH_SECONDS = 8.0
+
+# Owner-only, enforced on every start rather than assumed.
+#
+# These files carry what the user said and what JARVIS replied: the transcript
+# goes to the log (`transcript=%r`) and the reply's first 60 characters go to
+# the state file. At 0755/0644 -- the umask default they were created with --
+# any local account in group `staff` could read both, and this machine has
+# other accounts. The directory mode is the load-bearing control: 0700 stops
+# traversal regardless of what mode individual files end up with.
+# State-file format version. This numbers the SCHEMA and nothing else -- not
+# Hermes, not JARVIS, not a package. Present on every publish; a file without it
+# is v1, which is what everything written before this change looks like.
+SCHEMA_VERSION = 2
+
+# Quiet time between TTS playback ending and the wake detector being fed again.
+# A constant, not a tunable: `playback_end` is when afplay returned, not when
+# the room went quiet, and 400 ms covers the output buffer draining and the
+# first reflections without being long enough to feel.
+SETTLE_AFTER_SPEAKING_S = 0.400
+
+STATE_FILE_MODE = 0o600
+LOG_FILE_MODE = 0o600
+LOG_DIR_MODE = 0o700
+
+os.makedirs(LOG_DIR, exist_ok=True)
+try:
+    os.chmod(LOG_DIR, LOG_DIR_MODE)
+except OSError:
+    pass
+logger = logging.getLogger("jarvis")
+
+
+# --------------------------------------------------------------------------- log
+def _setup_logging() -> None:
+    path = os.path.join(LOG_DIR, "jarvis_runtime.log")
+    # Size-capped by hand: launchd does not rotate, and an always-on listener
+    # would otherwise grow without bound.
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > MAX_LOG_BYTES:
+            os.replace(path, path + ".1")
+    except OSError:
+        pass
+    # Create the file ourselves, at 0600, BEFORE FileHandler opens it.
+    #
+    # FileHandler would create it at the umask default and there would be a
+    # window -- however brief -- where a log full of transcripts was
+    # world-readable. Pre-creating closes that window and covers every path
+    # that produces a new file: first run, a deleted log, and the rotation
+    # just above. An existing file is left alone by O_CREAT and re-chmod'ed,
+    # so a log created before this change is fixed on the next start.
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, LOG_FILE_MODE)
+        try:
+            os.fchmod(fd, LOG_FILE_MODE)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[logging.FileHandler(path), logging.StreamHandler(sys.stdout)],
+    )
+
+
+# ------------------------------------------------------------------ single instance
+class SingleInstance:
+    """One runtime per machine. A stale lock from a killed process is reclaimed."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.fd = None
+
+    def __enter__(self):
+        import fcntl
+        self.fd = open(self.path, "w")
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self.fd.close()
+            raise RuntimeError("another jarvis_runtime already holds the lock")
+        self.fd.write(f"{os.getpid()}\n")
+        self.fd.flush()
+        return self
+
+    def __exit__(self, *exc):
+        import fcntl
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            self.fd.close()
+        except Exception:
+            pass
+
+
+# ------------------------------------------------------------------------- state
+_state_lock = threading.Lock()
+_state = {"state": "OFFLINE", "since": time.time(), "detail": ""}
+
+# Per-turn metadata, published alongside the state. Guarded by _state_lock --
+# the SAME lock set_state already takes, deliberately: a second lock would
+# introduce an ordering to get wrong, and there is nothing here worth that.
+# None of these helpers may be called from inside set_state's locked region.
+_turn = {"id": None, "route": None, "timeline": None}
+
+# The six labels jarvis_router can dispatch to. CONFIRMATION_REQUIRED is a gate
+# verdict rather than a backend and is deliberately NOT here: nothing is
+# dispatched for it, so it never becomes a route.
+ROUTES = ("LOCAL_FAST", "LOCAL_TOOL", "LOCAL", "WEB", "CODEX", "CLAUDE")
+
+# name -> (start mark, end mark). Every one is already measured by Timeline;
+# nothing new is instrumented.
+#
+#   wake_to_capture   wake accepted -> command capture begins. NOT "how long
+#                     detection took" -- and once the ACK subsystem lands, its
+#                     playback sits inside this interval, which is why the name
+#                     says what it spans rather than what fills it.
+#   capture_duration  the recording itself. The user talking, not overhead;
+#                     named so a 27.9 s capture is not read as 27.9 s of lag.
+#   stt               transcription.
+#   router            gate + route decision.
+#   backend           dispatch to the selected backend -> result.
+_LATENCY_STAGES = (
+    ("wake_to_capture", "wake_detected", "capture_start"),
+    ("capture_duration", "capture_start", "capture_end"),
+    ("stt", "stt_start", "stt_done"),
+    ("router", "router_start", "router_done"),
+    ("backend", "delegate_start", "delegate_done"),
+)
+
+# Beyond this the marks are wrong, not the turn. Published as null rather than
+# as a number nobody should believe.
+_MAX_LATENCY_MS = 3_600_000
+
+
+def _latency_snapshot(timeline) -> dict:
+    """Whatever is COMPLETE right now. Missing stages are null, never zero.
+
+    null means "not measured yet"; 0 means "measured, and it was zero". They
+    are different: router=0 is a real outcome on the greeting fast path, where
+    the gate settles the turn and the LLM never runs.
+    """
+    out = {name: None for name, _a, _b in _LATENCY_STAGES}
+    if timeline is None:
+        return out
+    for name, start, end in _LATENCY_STAGES:
+        value = timeline._ms(start, end)
+        if value is None:
+            continue
+        ms = int(round(value))
+        if ms < 0:                       # impossible from a monotonic clock
+            ms = 0
+        out[name] = None if ms > _MAX_LATENCY_MS else ms
+    return out
+
+
+def begin_turn(turn_id: int, timeline) -> None:
+    """Start of a turn. Must run BEFORE the LISTENING publish, or that publish
+    carries the previous turn's id -- the exact staleness this field exists to
+    prevent."""
+    with _state_lock:
+        _turn.update(id=int(turn_id), route=None, timeline=timeline)
+
+
+def set_turn_route(route: str) -> None:
+    """Record the dispatch target. Only the six known labels are accepted; an
+    unrecognised value leaves the route null rather than turning the field into
+    free text."""
+    with _state_lock:
+        _turn["route"] = route if route in ROUTES else None
+
+
+def end_turn() -> None:
+    """The ONE reset point. Call it BEFORE publishing IDLE, or IDLE carries the
+    finished turn's route and timings."""
+    with _state_lock:
+        _turn.update(id=None, route=None, timeline=None)
+
+
+def set_state(name: str, detail: str = "") -> None:
+    """Publish the HUD state. A file, not a socket: the HUD is read-only and
+    must never be able to reach back into the runtime."""
+    with _state_lock:
+        _state.update(state=name, since=time.time(), detail=detail)
+        # One consistent snapshot: id, route and timings are read together
+        # under the lock, so a publish can never pair one turn's route with
+        # another turn's numbers. Serialisation happens outside.
+        payload = {
+            "version": SCHEMA_VERSION,
+            "state": _state["state"],
+            "since": _state["since"],
+            "detail": _state["detail"],
+            "pid": os.getpid(),
+            "turn_id": _turn["id"],
+            "route": _turn["route"],
+            "latency_ms": _latency_snapshot(_turn["timeline"]),
+        }
+    tmp = STATE_PATH + ".tmp"
+    try:
+        # 0600 on the TEMP file, because os.replace() carries the source
+        # inode's mode across -- so setting it here is what makes every
+        # published state file owner-only, not just the first one. chmod'ing
+        # STATE_PATH after the fact would be undone by the very next publish.
+        #
+        # fchmod as well as the open mode: the mode argument to os.open is
+        # masked by the process umask, and this must not depend on what umask
+        # launchd happened to hand us.
+        #
+        # O_NOFOLLOW so the temp path cannot be pre-created as a symlink
+        # pointing somewhere else. The path is a constant, not input, but this
+        # file is being written with tightened permissions precisely so its
+        # contents stay put.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                     STATE_FILE_MODE)
+        try:
+            os.fchmod(fd, STATE_FILE_MODE)
+            with os.fdopen(fd, "w") as fh:
+                fd = -1                      # fdopen owns it now
+                json.dump(payload, fh, ensure_ascii=False)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        os.replace(tmp, STATE_PATH)
+    except OSError:
+        pass
+    logger.info("state=%s %s", name, detail)
+
+
+# ----------------------------------------------------------------------- timeline
+class Timeline:
+    """Monotonic marks for one turn, reported as intervals in ms.
+
+    time.monotonic() and not time.time(): a turn can straddle an NTP step or a
+    sleep/wake, and a wall clock that jumps backwards produces negative
+    latencies that look like a bug in the pipeline instead of a bug in the
+    clock.
+    """
+
+    ORDER = (
+        "wake_detected", "capture_start", "capture_end", "stt_start", "stt_done",
+        "gate_start", "gate_done", "router_start", "router_done",
+        "delegate_start", "delegate_done",
+        # TTS is four marks, not one: synthesis and playback are different
+        # costs and conflating them reported 8,282 ms for a 729 ms synthesis.
+        "tts_request_start", "tts_audio_ready", "playback_start",
+        "first_audio_played", "playback_end", "wake_rearmed",
+    )
+    # label -> (from mark, to mark)
+    INTERVALS = (
+        ("WAKE", "wake_detected", "capture_start"),
+        ("CAPTURE", "capture_start", "capture_end"),
+        ("STT", "stt_start", "stt_done"),
+        ("GATE", "gate_start", "gate_done"),
+        ("ROUTER", "router_start", "router_done"),
+        ("TTS_GENERATION", "tts_request_start", "tts_audio_ready"),
+        ("PLAYBACK_START_DELAY", "tts_audio_ready", "playback_start"),
+        ("PLAYBACK_DURATION", "playback_start", "playback_end"),
+        ("PLAYBACK_END_TO_WAKE_REARM", "playback_end", "wake_rearmed"),
+    )
+
+    def __init__(self) -> None:
+        self.marks: dict[str, float] = {}
+        self.route = ""
+        # Residency snapshot taken when this turn first reaches Ollama, used at
+        # turn end to decide whether the residency window is worth renewing.
+        # It lives on the Timeline because a Timeline IS the turn context: a new
+        # one per turn, so a flag here cannot survive into the next turn.
+        # None means "this turn never reached Ollama".
+        self.ollama_before: dict | None = None
+
+    def mark(self, name: str) -> None:
+        self.marks.setdefault(name, time.monotonic())
+
+    def mark_at(self, name: str, when: float) -> None:
+        """Place a mark at a known instant rather than at 'now'.
+
+        Needed where one call does two measurable things: the router runs the
+        deterministic gate and then the LLM inside a single route(), and it
+        already reports how long each took. Deriving the boundary from its own
+        numbers is honest; timing it from out here would just report the whole
+        call twice under two names.
+        """
+        self.marks.setdefault(name, when)
+
+    def _ms(self, a: str, b: str):
+        if a in self.marks and b in self.marks:
+            return (self.marks[b] - self.marks[a]) * 1000.0
+        return None
+
+    def report(self) -> str:
+        parts = []
+        for label, a, b in self.INTERVALS:
+            v = self._ms(a, b)
+            parts.append(f"{label}={v:.0f}" if v is not None else f"{label}=-")
+
+        # LOCAL_FAST / LOCAL_TOOL / CODEX / CLAUDE are the same interval under
+        # the name of whichever route actually ran, so a log line says where the
+        # time went without having to cross-reference the route decision.
+        # LOCAL_FAST and LOCAL_TOOL are reported separately because the whole
+        # point of the split is that they cost very different amounts.
+        delegate = self._ms("delegate_start", "delegate_done")
+        for name in ("LOCAL_FAST", "LOCAL_TOOL", "CODEX", "CLAUDE"):
+            hit = delegate if self.route == name else None
+            parts.append(f"{name}={hit:.0f}" if hit is not None else f"{name}=-")
+
+        # Measured to the moment audio starts, NOT to the moment it finishes.
+        # The old version ended this at playback end, which made a 6.8 s spoken
+        # sentence look like 6.8 s of latency.
+        total = self._ms("wake_detected", "first_audio_played")
+        parts.append(f"TOTAL_TO_FIRST_AUDIO={total:.0f}" if total is not None
+                     else "TOTAL_TO_FIRST_AUDIO=-")
+        return "timeline " + " ".join(f"{p}ms" if not p.endswith("=-") else p
+                                      for p in parts)
+
+    def marks_report(self) -> str:
+        t0 = self.marks.get("wake_detected")
+        if t0 is None:
+            return "marks (no wake mark)"
+        got = [(n, (self.marks[n] - t0) * 1000.0) for n in self.ORDER if n in self.marks]
+        return "marks " + " ".join(f"{n}=+{v:.0f}ms" for n, v in got)
+
+
+# -------------------------------------------------------------------------- warm
+# One warm in flight at a time. The startup worker and the post-turn renew both
+# call _warm_ollama and can overlap: a startup retry that is still waiting when
+# the user's first turn ends would otherwise run beside that turn's renew. The
+# second call would buy nothing -- both assert the same model and the same
+# keep_alive -- so the loser skips rather than queues.
+_warm_inflight = threading.Lock()
+
+
+def _ollama_ready(timeout: float = READY_PROBE_TIMEOUT) -> bool:
+    """One readiness probe against the local Ollama.
+
+    Ready means the connection is accepted AND a valid HTTP response comes
+    back, not merely that the port answers: during startup Ollama can accept a
+    connection before it can serve. /api/tags is the cheapest endpoint that
+    proves the server is actually up -- it lists what is installed, loads
+    nothing, and is the same native surface the warm itself uses.
+    """
+    import urllib.request
+
+    req = urllib.request.Request(f"{OLLAMA_URL}{OLLAMA_READY_PATH}",
+                                 method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read()
+            return 200 <= resp.status < 300
+    except Exception:
+        return False
+
+
+def _warm_ollama(reason: str, keep_alive: str = KEEP_ALIVE) -> bool:
+    """Load the router model and pin how long Ollama keeps it resident.
+
+    RESIDENCY, AND WHY THE WAKE-TIME WARM IS GONE.
+      This used to also fire on every wake, on the theory that the load would
+      overlap the user speaking. It did overlap -- and it was measured not to
+      matter: with Ollama cold-loading concurrently (17.64 s, free memory down
+      to 60 MB) STT still took 0.73 s, against 0.71 s with Ollama unloaded.
+      The contention hypothesis was refuted, so the wake-time warm buys nothing
+      and is removed rather than kept "just in case".
+
+      What the model DOES need is to still be loaded when the turn arrives.
+      Ollama's server default here is OLLAMA_KEEP_ALIVE=10m, so a quiet hour
+      dropped it and the next turn paid 17 s. keep_alive is accepted per
+      REQUEST on the native /api/chat endpoint -- verified: after one call with
+      "60m", `ollama ps` reported "59 minutes from now" -- so residency is
+      bought without touching the Ollama LaunchAgent or its global setting.
+
+      The window is renewed after every turn, so the model stays resident while
+      JARVIS is in use and lets go an hour after the last one. That keeps
+      7.23 GB out of Claude's and Codex's way on a 32 GB machine during the
+      long stretches when nobody is talking to JARVIS.
+
+    The native endpoint is used INSTEAD of /v1 here because /v1 is the
+    OpenAI-compatible surface and has no keep_alive field.
+    """
+    import urllib.request
+
+    if not _warm_inflight.acquire(blocking=False):
+        logger.info("ollama warm (%s): skipped, another warm in flight", reason)
+        return False
+    try:
+        body = json.dumps({
+            "model": ROUTER_MODEL,
+            "messages": [{"role": "user", "content": "ok"}],
+            "stream": False,
+            "keep_alive": keep_alive,
+            "options": {"num_predict": 1, "temperature": 0},
+        }).encode()
+        req = urllib.request.Request(f"{OLLAMA_URL}/api/chat", data=body,
+                                     headers={"Content-Type": "application/json"})
+        t = time.monotonic()
+        try:
+            urllib.request.urlopen(req, timeout=300).read()
+            logger.info("ollama warm (%s): %s ready in %.2fs, keep_alive=%s",
+                        reason, ROUTER_MODEL, time.monotonic() - t, keep_alive)
+            return True
+        except Exception as e:
+            logger.warning("ollama warm (%s) failed: %s", reason, type(e).__name__)
+            return False
+    finally:
+        _warm_inflight.release()
+
+
+def _model_residency() -> dict | None:
+    """Read whether Ollama currently holds ROUTER_MODEL, and until when.
+
+    /api/ps lists loaded runners. It loads nothing and extends nothing --
+    measured 2026-09-02: two snapshots either side of a one-second gap reported
+    an identical expires_at, and ten calls ran 0.7-4.7 ms.
+
+    Returns None when the answer is unknown (Ollama unreachable, bad JSON), so
+    the caller can tell "not resident" from "could not tell".
+    """
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"{OLLAMA_URL}/api/ps", timeout=2.0) as resp:
+            payload = json.load(resp)
+        models = payload.get("models")
+        if not isinstance(models, list):
+            return None
+    except Exception:
+        return None
+    # Exactly this model. Another model's window moving says nothing about
+    # whether JARVIS ran an inference.
+    entry = next((m for m in models
+                  if isinstance(m, dict) and m.get("name") == ROUTER_MODEL), None)
+    if entry is None:
+        return {"resident": False, "expires_at": None}
+    return {"resident": True, "expires_at": entry.get("expires_at")}
+
+
+def _ollama_was_used(before: dict | None, after: dict | None) -> bool | None:
+    """Did an inference against ROUTER_MODEL actually land during this turn?
+
+    Asked of Ollama rather than of the callers. The three inference sites --
+    jarvis_router (in this process), jarvis_local_fast and the summariser
+    heredoc (both inside the jarvis-dispatch SUBPROCESS) -- share no request
+    layer, so instrumenting them would mean editing three modules, one of them
+    a zsh script, plus a new channel to carry the answer back across the
+    process boundary. Ollama already knows, and says so in /api/ps.
+
+    Measured basis: a /v1/chat/completions call moved expires_at from
+    14:32:47 to 14:49:08, so a landed inference is always visible as either a
+    changed window or a model that was not resident before and is now.
+
+    Returns None for "cannot tell" -- see the caller for why that is not False.
+    """
+    if before is None or after is None:
+        return None
+    if not after.get("resident"):
+        # Nothing is loaded now, so nothing landed. A model that expired
+        # mid-turn without being used lands here too, which is correct.
+        return False
+    if not before.get("resident"):
+        return True
+    return after.get("expires_at") != before.get("expires_at")
+
+
+def _renew_residency(tl: "Timeline") -> None:
+    """Re-assert keep_alive, but only for a turn that actually used Ollama.
+
+    WHY THIS IS CONDITIONAL
+      It used to run in the turn's finally block unconditionally. Observed
+      2026-09-02 13:32: an ambient false wake produced a turn with no speech,
+      no STT, no router and no backend -- and still reloaded the expired 7.2 GB
+      model and pinned it for another hour. gemma4:e2b is 7.2 GB on a 32 GB
+      machine shared with Claude and Codex, and the wake word is known to fire
+      on room noise, so every false positive was buying an hour of residency
+      for a turn that used nothing.
+
+    WHY UNKNOWN SKIPS RATHER THAN RENEWS
+      Skipping costs a cold load on some later turn, which is the documented
+      idle trade-off anyway. Renewing on a guess resurrects exactly the 7.2 GB
+      this change exists to stop resurrecting. So unknown is not a renew.
+    """
+    before = tl.ollama_before
+    if before is None:
+        # The turn never reached _dispatch: no speech, empty transcript, or a
+        # false wake. Nothing was asked of Ollama, so nothing is renewed and
+        # nothing is even queried.
+        return
+    used = _ollama_was_used(before, _model_residency())
+    if used is None:
+        logger.info("ollama renew skipped: residency unknown (Ollama unreadable)")
+        return
+    if not used:
+        logger.info("ollama renew skipped: turn used no Ollama inference")
+        return
+    _warm_ollama("renew")
+
+
+def _startup_warm() -> None:
+    """Warm the router model at login, waiting for Ollama to come up first.
+
+    WHY THIS IS NOT JUST A LONGER TIMEOUT
+      The startup warm used to be a single POST. At login it lost the race with
+      `ollama serve` and got a refused connection, which fails immediately no
+      matter what timeout is set. The missing piece is a retry that waits for
+      the port, so readiness is probed separately from the warm.
+
+    WHY IT IS STILL A DAEMON THREAD STARTED AFTER THE LISTENER
+      Unchanged from before: the runtime reaches IDLE and answers "Hey Jarvis"
+      whether or not this succeeds. The budget is bounded so a machine with no
+      Ollama at all just loses the warm, exactly as it does today.
+
+    A turn that arrives mid-retry is not blocked or refused; it takes the
+    ordinary backend path. If it loads the model first, this worker's own warm
+    then finds it resident and merely re-asserts keep_alive -- Ollama serves one
+    runner per model, so the two cannot cold-load it twice.
+    """
+    t0 = time.monotonic()
+    deadline = t0 + READY_BUDGET
+    attempt = 0
+    announced_ready = False
+    while not _stop.is_set():
+        attempt += 1
+        if _ollama_ready():
+            if not announced_ready:
+                logger.info("ollama startup readiness: ready after=%.1fs attempts=%d",
+                            time.monotonic() - t0, attempt)
+                announced_ready = True
+            if _warm_ollama("startup"):
+                return
+        else:
+            logger.info("ollama startup readiness: waiting attempt=%d", attempt)
+        # The last backoff value repeats; the budget, not the tuple, ends this.
+        delay = READY_BACKOFF[min(attempt - 1, len(READY_BACKOFF) - 1)]
+        if time.monotonic() + delay >= deadline:
+            break
+        if _stop.wait(delay):
+            break
+    if _stop.is_set():
+        logger.info("ollama warm (startup): abandoned, runtime shutting down")
+    else:
+        logger.warning("ollama warm (startup): abandoned after=%.1fs attempts=%d",
+                       time.monotonic() - t0, attempt)
+
+
+def _warm_whisper() -> None:
+    """Pay the faster-whisper load once, at startup, off the hot path.
+
+    Upstream already caches the model for the process lifetime
+    (tools/transcription_tools.py keeps a module-global under a lock, and
+    unload_after_idle_seconds is 0 here, so it is never dropped). What it does
+    NOT do is load it before it is first needed -- so the first turn after a
+    reboot paid 6.16 s of load plus a huggingface metadata round trip inside
+    the turn. Nothing is cached that upstream did not already cache; the load
+    is only moved earlier.
+
+    Deliberately warmed by transcribing a throwaway tone through the ordinary
+    public entry point rather than by reaching for `_load_local_whisper_model`.
+    The private loader would skip the model-name normalization and the global
+    bookkeeping around it, and would then be primed under a name the real call
+    might not match -- which would silently load the model twice.
+    """
+    import math
+    import struct
+    import tempfile
+    import wave
+
+    t = time.monotonic()
+    path = None
+    try:
+        from tools import transcription_tools as tt
+        from tools import voice_mode as vm
+
+        # 0.6 s of quiet tone. Silence would be stripped by the VAD before the
+        # model was ever consulted, which would warm nothing.
+        rate = 16000
+        n = int(rate * 0.6)
+        frames = b"".join(
+            struct.pack("<h", int(2500 * math.sin(2 * math.pi * 220 * i / rate)))
+            for i in range(n)
+        )
+        fd, path = tempfile.mkstemp(suffix=".wav", prefix="jarvis_warm_")
+        os.close(fd)
+        with wave.open(path, "wb") as fh:
+            fh.setnchannels(1)
+            fh.setsampwidth(2)
+            fh.setframerate(rate)
+            fh.writeframes(frames)
+
+        vm.transcribe_recording(path)
+        cached = getattr(tt, "_local_model", None) is not None
+        logger.info("whisper warm: %.2fs cached=%s name=%r", time.monotonic() - t,
+                    cached, getattr(tt, "_local_model_name", None))
+    except Exception as e:
+        logger.warning("whisper warm failed: %s (%s)", type(e).__name__, e)
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+# -------------------------------------------------------------------------- main
+_stop = threading.Event()
+
+
+def _handle_signal(signum, _frame):
+    logger.info("signal %s — shutting down", signum)
+    _stop.set()
+
+
+def _dispatch(transcript: str, tl: "Timeline") -> str:
+    """Gate -> route -> delegate. Returns what should be spoken."""
+    import jarvis_router
+
+    # Everything downstream of here can reach Ollama: the router's own LLM in
+    # this process, and LOCAL_FAST plus the summariser inside the dispatch
+    # subprocess. Snapshotting HERE rather than at turn start keeps the window
+    # as narrow as the work itself -- capture and STT are local and cannot move
+    # the residency -- and means a turn that never gets this far issues no
+    # /api/ps at all.
+    tl.ollama_before = _model_residency()
+
+    # The gate runs inside jarvis_router.route(); it is marked separately here
+    # so a slow turn can be attributed without guessing. It is pure pattern
+    # matching and is expected to be sub-millisecond -- if it ever is not, that
+    # is a finding, which is exactly why it gets its own interval.
+    tl.mark("gate_start")
+    tl.mark("router_start")
+    decision = jarvis_router.route(transcript)
+    tl.mark("router_done")
+
+    # route() is gate-then-LLM in one call and reports both, so the gate/LLM
+    # boundary comes from its own numbers instead of being invented here.
+    # A turn the gate or the fast path settled never reaches the LLM, and then
+    # the whole call *is* the gate.
+    _total = float(decision.get("latency") or 0.0)
+    _llm = float(decision.get("llm_latency") or 0.0) if decision.get("llm_used") else 0.0
+    tl.mark_at("gate_done", tl.marks["router_start"] + max(0.0, _total - _llm))
+
+    route = decision["route"]
+    tl.route = route
+    set_state("ROUTING", f"{route} via {decision['decided_by']}")
+    logger.info("route=%s by=%s cats=%s llm_latency=%s", route,
+                decision["decided_by"], decision.get("categories"),
+                decision.get("llm_latency"))
+
+    if route == "CONFIRMATION_REQUIRED":
+        set_state("CONFIRMATION_REQUIRED", ",".join(decision.get("categories") or []))
+        cats = "・".join(decision.get("categories") or [])
+        # Speech only. Nothing is dispatched, nothing is executed.
+        return f"その操作は取り消せない可能性があります。{cats}に該当します。実行してよろしいですか？"
+
+    # Set the route HERE, not at the ROUTING publish above. The decision is
+    # already made by then, but the state still says "deciding" -- publishing a
+    # route at that instant is a small lie the HUD would render as a flicker.
+    set_turn_route(route)
+    set_state(route, "working")
+    dispatch = os.path.join(HERE, "jarvis-dispatch")
+
+    # Hand the decision down instead of letting jarvis-dispatch re-derive it.
+    # It used to run the whole router a second time in a second process -- a
+    # measured 2.3-3.9 s warm, and 17.67 s on the cold turn that prompted this
+    # work. The route travels in the environment rather than in argv so that
+    # the utterance stays the one and only positional argument.
+    #
+    # This is a fast path, NOT a trust boundary: jarvis-dispatch still refuses
+    # to execute anything for CONFIRMATION_REQUIRED, and the deterministic gate
+    # has already run here, upstream of the LLM. A route arriving by env can
+    # only pick among the same labels the router itself could have returned.
+    env = dict(os.environ)
+    env["JARVIS_ROUTE"] = route
+    env["JARVIS_ROUTE_BY"] = str(decision.get("decided_by") or "")
+    env["JARVIS_ROUTE_CATS"] = ",".join(decision.get("categories") or [])
+
+    tl.mark("delegate_start")
+    try:
+        p = subprocess.run([dispatch, transcript], capture_output=True, text=True,
+                           timeout=300, env=env)
+        out = (p.stdout or "").strip()
+        return out or "うまく応答できませんでした。"
+    except subprocess.TimeoutExpired:
+        return "処理に時間がかかりすぎたため中断しました。"
+    except Exception as e:
+        logger.exception("dispatch failed")
+        return f"内部エラーが発生しました。{type(e).__name__}"
+    finally:
+        tl.mark("delegate_done")
+
+
+def _speak(reply: str, tl: "Timeline", hvoice) -> None:
+    """Synthesize, then play, with the two timed separately.
+
+    WHY NOT hvoice.speak_text(). It does synthesis and playback in one blocking
+    call and returns only when the audio has finished, so the only honest mark
+    it can produce is "playback ended". Reporting that as first audio inflated
+    TTS to 8,282 ms in the real turn when synthesis had actually finished
+    729 ms in -- the number described the wrong event.
+
+    This composes the SAME upstream pieces in the same order
+    (prepare_spoken_text -> text_to_speech_tool -> play_audio_file) rather than
+    forking any of them, and falls back to speak_text whole if any piece is
+    missing, so an upstream change degrades to the old behaviour instead of
+    going silent.
+
+    HONEST LIMIT ON "first audio": playback_start is the instant the player is
+    handed the file. The gap between that and the first sample leaving the
+    speaker is inside afplay and is not observable from here -- it is small but
+    it is not zero, and TOTAL_TO_FIRST_AUDIO is therefore a lower bound. It is
+    no longer the playback-END time, which is what it used to be.
+    """
+    tl.mark("tts_request_start")
+    try:
+        from tools.tts_tool import text_to_speech_tool
+        from hermes_cli.voice import play_audio_file
+        try:
+            from tools.tts_text_normalize import prepare_spoken_text
+            spoken = prepare_spoken_text(reply, max_chars=None)
+        except Exception:
+            spoken = reply
+        if not spoken or not spoken.strip():
+            return
+
+        import tempfile
+        outdir = os.path.join(tempfile.gettempdir(), "hermes_voice")
+        os.makedirs(outdir, exist_ok=True)
+        mp3 = os.path.join(outdir, f"jarvis_{time.strftime('%Y%m%d_%H%M%S')}.mp3")
+
+        raw = text_to_speech_tool(text=spoken, output_path=mp3)
+        try:
+            res = json.loads(raw) if isinstance(raw, str) else {}
+        except Exception:
+            res = {}
+        tl.mark("tts_audio_ready")
+
+        paths = [p for p in (res.get("file_paths")
+                             or [res.get("file_path") or mp3])
+                 if p and os.path.isfile(p) and os.path.getsize(p) > 0]
+        if not res.get("success") or not paths:
+            logger.warning("TTS produced no audio; falling back to speak_text")
+            tl.mark("playback_start")
+            tl.mark("first_audio_played")
+            hvoice.speak_text(reply)
+            tl.mark("playback_end")
+            return
+
+        tl.mark("playback_start")
+        tl.mark("first_audio_played")   # lower bound; see the docstring
+        for p in paths:
+            play_audio_file(p)
+        tl.mark("playback_end")
+
+        for p in set(paths + [mp3, mp3.rsplit(".", 1)[0] + ".ogg"]):
+            if os.path.isfile(p):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+    except Exception:
+        logger.exception("split TTS failed; falling back to speak_text")
+        try:
+            tl.mark("playback_start")
+            tl.mark("first_audio_played")
+            hvoice.speak_text(reply)
+            tl.mark("playback_end")
+        except Exception:
+            logger.exception("TTS failed")
+
+
+def _tune_recorder(rec) -> None:
+    """Shorten the two waits that are pure dead time, and nothing else.
+
+    Set per instance. ~/.hermes/config.yaml is not written, so every other
+    surface keeps the values the user chose. The RMS threshold is not among
+    these: it is voice sensitivity, and it was measured innocent.
+    """
+    for attr, value in (("_silence_duration", SILENCE_DURATION_SECONDS),
+                        ("_max_wait", MAX_WAIT_FOR_SPEECH_SECONDS)):
+        if hasattr(rec, attr):
+            setattr(rec, attr, value)
+        else:
+            # Upstream renamed it. Say so instead of silently running with the
+            # default and reporting a tuning that never took effect.
+            logger.warning("recorder has no %s -- capture tuning not applied", attr)
+
+
+def _recorder_state(rec, turn: int, when: str) -> None:
+    """One line per turn, so a bad turn can be compared against a good one.
+
+    Written after the second-turn failure, where the useful evidence turned out
+    to be a single boolean -- the stream object was the same on both turns, and
+    only `active` differed.
+    """
+    st = getattr(rec, "_stream", None)
+    logger.info(
+        "recorder %s TURN=%d RECORDER_OBJECT=%s STREAM_OBJECT=%s STREAM_ACTIVE=%s "
+        "DEVICE=%s RATE=%s MAX_WAIT=%s SILENCE_DURATION=%s THRESHOLD=%s",
+        when, turn, hex(id(rec)), hex(id(st)) if st is not None else "None",
+        bool(getattr(st, "active", False)) if st is not None else False,
+        _device_label(rec), getattr(rec, "_sample_rate", None),
+        getattr(rec, "_max_wait", None), getattr(rec, "_silence_duration", None),
+        getattr(rec, "_silence_threshold", None))
+
+
+def _device_label(rec) -> str:
+    try:
+        from tools import voice_mode as vm
+        return str(vm._identity_label(getattr(rec, "_stream_identity", None)))
+    except Exception:
+        return "unknown"
+
+
+def _prepare_recorder_for_turn(box: dict, vm, turn: int):
+    """Hand back a recorder that is actually able to capture, this turn.
+
+    HISTORY, because the shape of this function is the shape of two bugs.
+
+    AudioRecorder keeps one InputStream for the life of the process, and
+    `_ensure_stream()` returns early whenever it already holds a stream on the
+    same device -- it never asks whether that stream is still RUNNING. When the
+    wake listener owned its own stream, resuming it reopened the same input
+    device and left the recorder's stream stopped, so from the second turn
+    onward `start()` was handed a dead handle: same object id, `active=False`,
+    zero callbacks, zero frames, a capture that could only end on the 30 s
+    ceiling.
+
+    This function used to fix that by closing the dead stream so `start()`
+    would rebuild it -- which put a `Pa_StartStream` call on the hot path of
+    every turn, and that call deadlocked inside CoreAudio four times in
+    production.
+
+    Both bugs had the same cause: two consumers opening the same device around
+    each other. With the shared stream (see shared_audio.py) the wake detector
+    opens nothing at all, so the recorder's stream is never stopped behind our
+    back and there is nothing to rebuild. A normal turn now performs NO stream
+    operation. `shared.ensure_healthy_for_turn` still replaces a genuinely dead
+    stream, but that is a recovery path, not the common one.
+
+    Device-following is untouched: `_ensure_stream()` still compares the OS
+    default input identity, and no numeric PortAudio index is stored anywhere.
+    """
+    rec = box.get("rec")
+    shared = box.get("shared")
+
+    if rec is None:
+        rec = vm.AudioRecorder()
+        box["rec"] = rec
+        logger.info("created a new AudioRecorder")
+
+    if shared is not None:
+        shared.ensure_healthy_for_turn(turn)
+
+    # EVERY turn, not once at construction. The tuning used to live inside the
+    # `if rec is None` branch, so turns 2+ silently ran on upstream defaults --
+    # which is also why the "recorder tuned" line was missing from them.
+    _tune_recorder(rec)
+    _recorder_state(rec, turn, "before")
+    return rec
+
+
+def _handle_wake(recorder_box: dict) -> None:
+    from hermes_cli import voice as hvoice
+    from tools import voice_mode as vm
+    from tools import wake_word as ww
+
+    tl = Timeline()
+    tl.mark("wake_detected")
+    owner = recorder_box["owner"]
+
+    # NO wake-time model warm. It was measured not to help (see _warm_ollama):
+    # STT ran at 0.73 s with Ollama cold-loading concurrently against 0.71 s
+    # with Ollama unloaded. Residency is bought at startup and renewed after
+    # each turn instead, which costs the hot path nothing.
+
+    shared = recorder_box.get("shared")
+    try:
+        # LEASE POLICY (a): a manual activation joins here and obeys the same
+        # rule as a wake. If the machine-wide wake lease is not ours -- an
+        # interactive `hermes chat` can hold it -- the turn declines rather than
+        # fighting for the microphone. No manual-only bypass exists; the problem
+        # this activation path solves is a detector that does not score the
+        # user's voice, not a lease subsystem that has failed.
+        if not ww.pause_listening(owner=owner):
+            logger.warning("activation ignored: the listener lease was not ours")
+            return
+
+        # Stop feeding the detector for the duration of the turn. The physical
+        # stream keeps running; only the handoff stops. See
+        # SharedAudioInput.gate_wake_feed.
+        if shared is not None:
+            shared.gate_wake_feed()
+
+        # Increment BEFORE publishing, so the LISTENING state carries this
+        # turn's id and not the previous one. Exactly once per turn: nothing
+        # between here and the finally block touches the counter again.
+        recorder_box["turn"] = recorder_box.get("turn", 0) + 1
+        turn = recorder_box["turn"]
+        begin_turn(turn, tl)
+        set_state("LISTENING", "capturing utterance")
+        rec = _prepare_recorder_for_turn(recorder_box, vm, turn)
+
+        done = threading.Event()
+        tl.mark("capture_start")
+        rec.start(on_silence_stop=done.set)
+        # VAD auto-stop, with a hard ceiling so a stuck stream cannot hold the
+        # mic forever.
+        fired = done.wait(timeout=30)
+        frames = len(getattr(rec, "_frames", []) or [])
+        peak = getattr(rec, "_peak_rms", None)
+        wav = rec.stop()
+        tl.mark("capture_end")
+        _recorder_state(rec, turn, "after ")
+        # FRAMES is the one number that separates "the room was quiet" from
+        # "the stream was dead": the callback appends a chunk for every buffer
+        # while recording, so a healthy stream is non-zero even in silence.
+        logger.info("capture TURN=%d silence_cb_fired=%s FRAMES=%d PEAK_RMS=%s wav=%s %s",
+                    turn, fired, frames, peak, bool(wav),
+                    shared.counters() if shared is not None else "")
+        if frames == 0:
+            logger.error("capture TURN=%d received ZERO frames -- the input stream "
+                         "delivered no callbacks", turn)
+        if not wav:
+            set_state("IDLE", "no speech")
+            return
+
+        set_state("THINKING", "transcribing")
+        tl.mark("stt_start")
+        res = vm.transcribe_recording(wav)
+        tl.mark("stt_done")
+        transcript = (res.get("transcript") or "").strip() if isinstance(res, dict) else ""
+        logger.info("transcript=%r", transcript)
+        if not transcript:
+            set_state("IDLE", "empty transcript")
+            return
+
+        reply = _dispatch(transcript, tl)
+        set_state("SPEAKING", reply[:60])
+        _speak(reply, tl, hvoice)
+    finally:
+        # SETTLE, then re-arm, then re-open the gate -- in that order.
+        #
+        # `playback_end` marks when afplay returned, which is not when the room
+        # is quiet: the output buffer is still draining and the first reflections
+        # are still in the air. Waiting here costs nothing a user notices and is
+        # the whole reason the gate has a settle at all.
+        #
+        # The order matters. resume_listening() restarts the detector thread,
+        # which drains its queue as it starts; re-opening the feed only after
+        # that means no frame from this turn can be waiting for it.
+        _stop.wait(SETTLE_AFTER_SPEAKING_S)
+        try:
+            ww.resume_listening(owner=recorder_box["owner"])
+        except Exception:
+            logger.exception("failed to resume the wake listener")
+        if shared is not None:
+            shared.ungate_wake_feed()
+        tl.mark("wake_rearmed")
+        # Order matters: clear the turn context, THEN publish IDLE. The other
+        # way round leaves the finished turn's route and timings in the IDLE
+        # state for the HUD to show as if a turn were still running.
+        end_turn()
+        set_state("IDLE", "waiting for wake word")
+        logger.info("%s", tl.report())
+        logger.info("%s", tl.marks_report())
+        # Renew residency AFTER the mic is listening again, on a thread, so a
+        # slow Ollama can never delay the user's next "Hey Jarvis". The thread
+        # decides for itself whether this turn earned a renew; a turn that never
+        # reached Ollama returns without touching the network.
+        threading.Thread(target=_renew_residency, args=(tl,), daemon=True).start()
+
+
+def main() -> int:
+    _setup_logging()
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
+    set_state("OFFLINE", "starting")
+
+    from tools import wake_word as ww
+
+    cfg = ww.load_wake_word_config()
+    if not cfg.get("enabled"):
+        logger.error("wake_word.enabled is false — nothing to do")
+        set_state("OFFLINE", "wake word disabled in config")
+        return 78
+
+    owner = object()
+    box = {"owner": owner, "rec": None, "shared": None}
+    inflight = threading.Lock()
+
+    # THE SINGLE PHYSICAL INPUT STREAM. Opened and started here, once, before
+    # the wake listener is armed -- and never touched again on a normal turn.
+    # This is what removes the per-turn Pa_StartStream that deadlocked four
+    # times in production; see shared_audio.py for the full account.
+    from tools import voice_mode as vm
+
+    from shared_audio import SharedAudioInput
+
+    rec = vm.AudioRecorder()
+    box["rec"] = rec
+    _tune_recorder(rec)
+    shared = SharedAudioInput(vm, ww, rec, owner)
+    box["shared"] = shared
+    try:
+        if not shared.open_once():
+            # Arming the wake listener would be pointless: in external_audio
+            # mode it has no microphone of its own to fall back to.
+            set_state("ERROR", "shared input stream did not start")
+            logger.error("shared audio: the stream did not become active")
+            return 74
+    except Exception as e:
+        set_state("ERROR", f"shared input stream failed: {type(e).__name__}")
+        logger.exception("shared audio: failed to open the input stream")
+        return 74
+    shared.attach_wake()
+
+    def on_wake(source: str = "wake"):
+        # The detector fires from its own thread; never block it. The manual
+        # activation socket calls the SAME function, so both entries take the
+        # same non-blocking lock: an ACTIVATE arriving mid-turn (or during the
+        # settle) is refused as BUSY rather than starting a second turn, and
+        # a wake and a manual trigger landing together produce one turn_id, not
+        # two, because only one of them can hold `inflight`.
+        if not inflight.acquire(blocking=False):
+            logger.info("%s ignored — a turn is already in flight", source)
+            return
+        def run():
+            try:
+                _handle_wake(box)
+            finally:
+                inflight.release()
+        threading.Thread(target=run, daemon=True).start()
+
+    # The wake microphone is a MACHINE-WIDE lease (~/.hermes/runtime/wake-word.lock).
+    # An interactive `hermes chat` claims it too, so the runtime must not die when
+    # the user happens to have a session open — under launchd that would be a
+    # crash loop. Wait for the lease instead, and take over the moment it frees.
+    detector = None
+    backoff = 5.0
+    while detector is None and not _stop.is_set():
+        try:
+            # external_audio: the detector opens NO microphone of its own and
+            # consumes the frames shared_audio feeds it. Upstream buffers those
+            # in a bounded queue (maxsize 64, drop-oldest) and runs inference on
+            # its own thread, so the audio callback never waits on the model.
+            detector = ww.start_listening(on_wake, owner=owner, config=cfg,
+                                          external_audio=True)
+        except ww.WakeWordInUse:
+            set_state("OFFLINE", "wake mic owned by another surface (hermes chat?) — waiting")
+            logger.info("wake mic already owned; retrying in %.0fs", backoff)
+            _stop.wait(backoff)
+            backoff = min(backoff * 1.5, 60.0)
+        except Exception as e:
+            set_state("ERROR", f"listener start failed: {type(e).__name__}")
+            logger.exception("failed to start the wake listener; retrying in %.0fs", backoff)
+            _stop.wait(backoff)
+            backoff = min(backoff * 1.5, 60.0)
+    if detector is None:
+        set_state("OFFLINE", "stopped before acquiring the wake mic")
+        return 0
+    # In external_audio mode the detector's own device details read "client
+    # capture" -- true of the detector, useless to a human. Report the device
+    # the shared stream is actually on, which is what the HUD shows too.
+    device_name = vm._identity_label(rec._stream_identity)
+    logger.info("wake listener up: device=%s rate=%s phrase=%r provider=%s "
+                "external_audio=True %s",
+                device_name, rec._sample_rate,
+                cfg.get("phrase"), cfg.get("provider"), shared.counters())
+    set_state("IDLE", f"listening on {device_name}")
+
+    # MANUAL ACTIVATION. Bound only now, once a turn can actually be served.
+    #
+    # It exists because the wake model does not currently fire for this user on
+    # this microphone -- 0/5 in a device A/B, and no activation at all in a
+    # 150-second observation -- and a voice assistant with one unreliable
+    # entrance is not usable. The socket carries the single verb ACTIVATE and
+    # nothing else: no command text, no arguments, no paths. The spoken request
+    # is still captured by the microphone exactly as after a wake, so the router
+    # and the security gate see an identical turn.
+    activation = None
+    try:
+        import activation_socket
+        activation = activation_socket.serve(lambda: on_wake("manual activation"),
+                                             _stop)
+    except Exception:
+        # Losing the fallback must not cost us the wake word too.
+        logger.exception("activation socket unavailable this run")
+    if activation is not None:
+        box["activation"] = activation
+
+    # Warm the two cold starts that the first real turn would otherwise pay for
+    # inside the turn: 6.16 s of faster-whisper load (plus a huggingface
+    # metadata round trip) and 17.67 s of gemma4:e2b load. Done after the
+    # listener is up, so "Hey Jarvis" already works while this finishes, and on
+    # a thread so a slow or absent Ollama cannot delay the listener.
+    #
+    # The Ollama warm goes through _startup_warm, which waits for the server to
+    # be listening before warming. At login the two LaunchAgents start together
+    # and the bare warm lost that race, leaving the model cold for the first
+    # real turn (measured: 17,866 ms against 3,878-4,214 ms warm).
+    threading.Thread(target=_warm_whisper, daemon=True).start()
+    threading.Thread(target=_startup_warm, daemon=True).start()
+
+    # Health watchdog. Upstream flags a stream that delivers only silence
+    # (audio_silent after ~10 s); after a sleep/wake the CoreAudio handle can
+    # survive as a live-but-dead stream, which looks exactly like that.
+    #
+    # Restarting the DETECTOR no longer fixes that -- in external_audio mode it
+    # owns no device, so silence means the shared stream is the deaf one. The
+    # only repair is replacing that stream, which is also the one remaining way
+    # to reach the Pa_StartStream call that deadlocked in production. So it is
+    # rationed hard: never during a turn, at most once a minute, at most
+    # MAX_SILENCE_REPLACEMENTS for the life of the process. Left unbounded this
+    # would be a reopen loop against a device that is not coming back.
+    MAX_SILENCE_REPLACEMENTS = 3
+    silence_replacements = 0
+    last_restart = 0.0
+    while not _stop.is_set():
+        _stop.wait(5.0)
+        if _stop.is_set():
+            break
+        try:
+            if getattr(detector, "audio_silent", False) and not inflight.locked():
+                now = time.time()
+                if now - last_restart > 60:
+                    last_restart = now
+                    if silence_replacements >= MAX_SILENCE_REPLACEMENTS:
+                        logger.error("mic still silent after %d replacements — "
+                                     "leaving the stream alone",
+                                     silence_replacements)
+                        set_state("ERROR", "mic silent; replacements exhausted")
+                        continue
+                    silence_replacements += 1
+                    logger.warning("shared stream reports silence — controlled "
+                                   "replacement %d/%d",
+                                   silence_replacements, MAX_SILENCE_REPLACEMENTS)
+                    set_state("ERROR", "mic silent; replacing input stream")
+                    try:
+                        detector.pause()
+                        shared.detach()
+                        try:
+                            rec._close_stream_with_timeout()
+                        except Exception:
+                            logger.exception("closing the silent stream failed")
+                        shared.open_once()
+                        shared.attach_wake()
+                        detector.resume()
+                        detector.audio_silent = False
+                        name = vm._identity_label(rec._stream_identity)
+                        logger.info("shared stream replaced on device=%s %s",
+                                    name, shared.counters())
+                        set_state("IDLE", f"listening on {name}")
+                    except Exception:
+                        logger.exception("shared stream replacement failed")
+                        set_state("ERROR", "input stream replacement failed")
+        except Exception:
+            logger.exception("watchdog error")
+
+    logger.info("stopping")
+    try:
+        ww.stop_listening(owner=owner)
+    except Exception:
+        pass
+    rec = box.get("rec")
+    if rec is not None:
+        try:
+            rec.shutdown()
+        except Exception:
+            pass
+    set_state("OFFLINE", "stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        with SingleInstance(LOCK_PATH):
+            sys.exit(main())
+    except RuntimeError as e:
+        print(f"jarvis_runtime: {e}", file=sys.stderr)
+        sys.exit(75)

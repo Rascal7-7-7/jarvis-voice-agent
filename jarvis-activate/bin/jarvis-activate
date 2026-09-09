@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Send ACTIVATE to the running JARVIS runtime. Nothing else.
+
+    jarvis-activate            start a turn
+    jarvis-activate --status   is the socket there?
+
+There are no other arguments on purpose. This tool cannot pass a command, a
+path, a file or any text to the runtime, because the socket does not accept any:
+the request is spoken and captured by the microphone exactly as it is after a
+wake word. A trigger that could carry a payload would be a trigger whose payload
+had to be validated forever.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import socket
+import stat
+import sys
+
+SOCKET = os.path.expanduser("~/.hermes/runtime/jarvis-activate.sock")
+ACTIVATE = b"ACTIVATE"
+
+
+def check(path: str) -> str | None:
+    """Why the socket is unusable, or None if it looks fine."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return "not present — is the runtime up, and did it bind the socket?"
+    if not stat.S_ISSOCK(st.st_mode):
+        return "exists but is not a socket"
+    if st.st_uid != os.getuid():
+        return f"owned by uid {st.st_uid}, not {os.getuid()}"
+    return None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--status", action="store_true",
+                    help="report on the socket without sending anything")
+    ap.add_argument("--socket", default=SOCKET, help=argparse.SUPPRESS)
+    a = ap.parse_args()
+
+    why = check(a.socket)
+    if a.status:
+        print(f"socket: {a.socket}")
+        if why:
+            print(f"  unusable: {why}")
+            return 1
+        st = os.lstat(a.socket)
+        print(f"  ok, mode {stat.S_IMODE(st.st_mode):04o}, uid {st.st_uid}")
+        return 0
+
+    if why:
+        print(f"jarvis-activate: {a.socket}: {why}", file=sys.stderr)
+        return 1
+
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(3.0)
+            s.connect(a.socket)
+            s.sendall(ACTIVATE)
+    except OSError as e:
+        print(f"jarvis-activate: {e}", file=sys.stderr)
+        return 1
+    # The runtime decides whether this becomes a turn: mid-turn it is refused as
+    # busy. Saying "sent" rather than "activated" keeps that honest.
+    print("ACTIVATE sent")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
