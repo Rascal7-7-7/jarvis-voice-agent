@@ -478,3 +478,38 @@ tests: `test_audio_output.py` 14件（新規）、`test_jarvis_status.py` 79 →
 10,635 ms   適応しきい値の導入後
  7,927 ms   本変更後の実測
 ```
+
+---
+
+## 変更9: Turn チェック — Capture の穴を塞ぐ
+
+### 問題
+`Capture` チェックは capture 単体の健全性しか見ていない。2026-09-09 の `TURN=4` は
+`silence_cb_fired=True` / `PEAK_RMS=1801` だったので `Capture ✓` を出したが、
+timeline は `STT=112ms` の後 `GATE` 以降が全て `-` で応答音声は再生されていない。
+
+**「音は入ったが言葉として成立しなかった」ターンを ✓ と判定していた。**
+利用者から見ると「status は ✓ なのに返答がない」状態になる。
+
+### 対策
+決定的な signal は `PLAYBACK_DURATION`。これが `-` なら利用者は何も聞いていない。
+「再生まで到達したか」を一次判定にし、`STT` の有無で原因を切り分ける。
+
+```
+Turn ✓ 応答まで到達 / TOTAL_TO_FIRST_AUDIO=7927ms
+Turn ! 音声は取得できましたが応答に到達しませんでした（STT=112ms の後で停止）
+Turn ! 発話が認識されませんでした（STT が実行されていません）
+```
+
+判定は**最後の timeline 行**に対して行う（過去の失敗で永久に WARN が残らないよう、
+Capture チェックと同じ方針）。
+
+これで音声経路の全段が 1 画面で追える:
+```
+Device  入力デバイス（優先順位で固定）
+Capture 音が取れたか
+Turn    応答まで到達したか
+Output  出力デバイス（UID で固定）
+```
+
+tests: `test_jarvis_status.py` 82 → 88件。

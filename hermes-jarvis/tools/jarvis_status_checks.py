@@ -270,6 +270,63 @@ def evaluate_shared_stream(counters: Mapping[str, Any] | None) -> Check:
     return Check("Audio", OK, summary, data)
 
 
+# -------------------------------------------------------------------- turn
+#
+# Capture チェックの穴を塞ぐ（2026-09-09 実測）。
+#   TURN=4 は silence_cb_fired=True / PEAK_RMS=1801 なので Capture は OK を出すが、
+#   timeline は STT=112ms の後 GATE 以降が全て `-` で応答音声は再生されていない。
+#   「音は入ったが言葉として成立しなかった」ターンを OK と判定してしまい、
+#   利用者から見ると「status は ✓ なのに返答がない」状態になる。
+#
+# 決定的な signal は PLAYBACK_DURATION。これが `-` なら利用者は何も聞いていない。
+# 「再生まで到達したか」を一次判定にし、STT の有無で原因を切り分ける。
+
+_TL_FIELD = re.compile(r"(\w+)=(-|\d+)(?:ms)?")
+
+
+def parse_timeline(line: str) -> dict[str, int | None]:
+    """timeline 行を {キー: ミリ秒 or None} にする。`-` は None。"""
+    out: dict[str, int | None] = {}
+    for key, value in _TL_FIELD.findall(line or ""):
+        out[key] = None if value == "-" else int(value)
+    return out
+
+
+def evaluate_turn(lines: Sequence[str]) -> Check:
+    """直近のターンが応答音声まで到達したか。
+
+    判定は**最後の timeline 行**に対して行う。過去の失敗で永久に WARN が
+    残らないようにする（Capture チェックと同じ方針）。
+    """
+    timelines = [l for l in lines if "timeline WAKE=" in l or "timeline " in l]
+    if not timelines:
+        return Check("Turn", OK, "まだターンがありません", {"available": False})
+
+    fields = parse_timeline(timelines[-1])
+    if not fields:
+        return Check("Turn", OK, "timeline を解析できませんでした",
+                     {"available": False})
+
+    playback = fields.get("PLAYBACK_DURATION") is not None
+    stt = fields.get("STT")
+    total = fields.get("TOTAL_TO_FIRST_AUDIO")
+    data = {"available": True, "playback": playback, "stt_ms": stt,
+            "total_ms": total}
+
+    if playback:
+        detail = f"応答まで到達 / TOTAL_TO_FIRST_AUDIO={total}ms" if total \
+            else "応答まで到達"
+        return Check("Turn", OK, detail, data)
+
+    if stt is not None:
+        return Check("Turn", WARN,
+                     f"音声は取得できましたが応答に到達しませんでした"
+                     f"（STT={stt}ms の後で停止）", data)
+
+    return Check("Turn", WARN,
+                 "発話が認識されませんでした（STT が実行されていません）", data)
+
+
 # ------------------------------------------------------------------ output
 #
 # 2026-09-09 実測: TTS は mp3 を生成し PLAYBACK_DURATION も記録されるのに音が出なかった。

@@ -671,3 +671,65 @@ def test_output_check_warns_when_pinning_is_unavailable():
     chk = c.evaluate_output("Realtek USB2.0 Audio", muted=False, volume=88,
                             pinned=None)
     assert chk.status == c.WARN
+
+
+# -------------------------------------------------------------------- turn
+#
+# Capture チェックの穴（2026-09-09 実測）:
+#   TURN=4 は silence_cb_fired=True / PEAK_RMS=1801 だったので Capture は ✓ を出すが、
+#   timeline は STT=112ms の後 GATE 以降が全て `-` で、応答音声は再生されていない。
+#   つまり「音は入ったが言葉として成立しなかった」ターンを ✓ と判定していた。
+#   利用者から見ると「status は ✓ なのに返答がない」状態になる。
+#
+#   決定的な signal は PLAYBACK_DURATION。これが `-` なら利用者は何も聞いていない。
+
+def _tl(**kw):
+    base = {"WAKE": "319ms", "CAPTURE": "8015ms", "STT": "112ms", "GATE": "-",
+            "ROUTER": "-", "TTS_GENERATION": "-", "PLAYBACK_START_DELAY": "-",
+            "PLAYBACK_DURATION": "-", "TOTAL_TO_FIRST_AUDIO": "-"}
+    base.update(kw)
+    body = " ".join(f"{k}={v}" for k, v in base.items())
+    return f"2026-09-09 12:00:00 INFO jarvis: timeline {body}"
+
+
+def test_turn_check_without_any_turn_is_ok():
+    chk = c.evaluate_turn(["2026-09-09 12:00:00 INFO jarvis: state=IDLE"])
+    assert chk.status == c.OK
+    assert chk.data["available"] is False
+
+
+def test_a_completed_turn_is_ok_and_reports_the_total():
+    chk = c.evaluate_turn([_tl(GATE="0ms", ROUTER="2116ms",
+                               TTS_GENERATION="560ms",
+                               PLAYBACK_DURATION="5846ms",
+                               TOTAL_TO_FIRST_AUDIO="7927ms")])
+    assert chk.status == c.OK
+    assert "7927" in chk.detail
+
+
+def test_a_turn_that_captured_audio_but_never_replied_is_warned():
+    """今日踏んだケース。Capture は ✓ でもここで捕まる。"""
+    chk = c.evaluate_turn([_tl()])
+    assert chk.status == c.WARN
+    assert "応答" in chk.detail
+    assert chk.data["playback"] is False
+    assert chk.data["stt_ms"] == 112
+
+
+def test_a_turn_with_no_speech_recognised_is_warned_differently():
+    chk = c.evaluate_turn([_tl(STT="-")])
+    assert chk.status == c.WARN
+    assert chk.data["stt_ms"] is None
+
+
+def test_only_the_most_recent_turn_matters():
+    lines = [_tl(), _tl(GATE="0ms", ROUTER="1ms", PLAYBACK_DURATION="3000ms",
+                        TOTAL_TO_FIRST_AUDIO="5000ms")]
+    chk = c.evaluate_turn(lines)
+    assert chk.status == c.OK
+
+
+def test_turn_check_tolerates_a_malformed_timeline():
+    chk = c.evaluate_turn(["2026-09-09 12:00:00 INFO jarvis: timeline garbage"])
+    assert chk.status in (c.OK, c.WARN)
+    assert isinstance(chk.data, dict)
