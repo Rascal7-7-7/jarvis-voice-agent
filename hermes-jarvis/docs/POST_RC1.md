@@ -397,3 +397,84 @@ USB オーディオが再認識されるため）。
 - **恒久対策は未実装。** ドックが既定を奪い返す問題は残っている。
   `afplay` にデバイス指定が無く `osascript` でもデバイスは変えられないため、
   出力側の優先順位付けには `switchaudio-osx` 等の外部ツールが必要。導入は未承認。
+
+---
+
+## 変更8: 出力デバイスの固定（システム既定に依存しない）
+
+### 問題
+`afplay` に**デバイス指定オプションが無い**（実測: 音量・時間・レートのみ）ため、
+JARVIS はシステム既定出力にしか出せなかった。そして既定は安定しない:
+
+- 内蔵マイクの切り分けでジャックを抜いた際に既定出力が DisplayLink ドックへ移り、
+  挿し直しても macOS は戻さなかった
+- 手動で戻してもディスプレイのスリープ復帰で**ドックが既定を奪い返す**（2 回発生）
+- 結果、応答音声が数時間にわたって無音だった
+
+### 解決の鍵（2つとも実測で確認）
+1. **`ffmpeg` の audiotoolbox 出力は `-audio_device_index` を持つ。**
+   実機検証: 既定=イヤホンの状態で index 8（本体スピーカー）を指定したら
+   **本体から鳴った**。システム既定を無視して指定先へ流せる。
+2. **JARVIS は自前の `_speak()`（`jarvis_runtime.py:787`）から
+   `play_audio_file(p)` を呼んでいる。** 上流を触らずに差し替えられる。
+
+### 実装: bin/audio_output.py
+```
+優先順位（UID で照合）
+  1 BuiltInHeadphoneOutputDevice   イヤホン/ジャック
+  2 BuiltInSpeakerDevice           内蔵スピーカー（クラムシェルでも鳴ると実測確認）
+除外 9件
+  AppleUSBAudioEngine:DisplayLink…      ドック
+  AppleUSBAudioEngine:Generic:USB…      Realtek
+  430F0024-…（HDMI モニタ ×2）
+  NMAudioDevice_UID / NMAudioMicDevice_UID   NoMachine 仮想
+  BuiltInHeadphoneInputDevice / BuiltInMicrophoneDevice   入力専用
+```
+
+### 設計判断
+**index ではなく UID で照合する。** `ffmpeg` の index はデバイスの抜き差しで
+振り直されるが UID は不変。これは入力側で index 保存が潜在バグになった反省でもある
+（変更7 参照）。再生のたびに UID → index を解決する。
+
+**未知のデバイスは「選ばない」— 入力側とは逆にした。**
+入力（`audio_devices`）では未知の名前を実マイクとみなした。USB マイクの可能性が
+最も高く、仮想ドライバは除外リストで落とせるため。
+出力には「開けるが音が出ない機器」（繋がっていないドック、スピーカー無しの HDMI
+モニタ）が**実在する**。それを選ぶと今日と同じ無音事故になる。
+同じ枠組みでも、間違えたときの損害が非対称なので意図的に分けた。
+USB ヘッドセット等は `JARVIS_OUTPUT_UID` で明示指定する。
+
+**失敗したら `afplay`（システム既定）へフォールバックする。**
+鳴らないより既定で鳴る方がよい。
+
+### レイテンシ
+懸念していた起動オーバーヘッドは**存在しなかった**（3回平均）:
+```
+ffmpeg(固定)  1871 ms
+afplay(既定)  2292 ms   ← 既存の方が遅い
+```
+
+### 実機検証（2026-09-09 18:2x）
+```
+システム既定 = Realtek USB2.0 Audio          （ドック）
+JARVIS 固定  = BuiltInHeadphoneOutputDevice   （イヤホン）
+→ ユーザーがイヤホンから応答音声を聴取
+```
+**システム既定がドックのまま、JARVIS の音声だけがイヤホンへ流れた。**
+他のアプリの音は既定に従うので、JARVIS だけが固定される。
+
+### jarvis-status
+```
+Output ✓ BuiltInHeadphoneOutputDevice（JARVIS が固定）/ 音量 88
+```
+固定できている場合は「既定が怪しい」警告を出さない（固定されていれば既定が
+奪われても影響しないため）。ミュートと音量 0 は固定の有無に関係なく警告する。
+
+tests: `test_audio_output.py` 14件（新規）、`test_jarvis_status.py` 79 → 82件。
+
+### 今日のレイテンシ推移（1ターン / TOTAL_TO_FIRST_AUDIO）
+```
+39,966 ms   capture が 30 秒上限に張り付き（所見#9 修正前）
+10,635 ms   適応しきい値の導入後
+ 7,927 ms   本変更後の実測
+```

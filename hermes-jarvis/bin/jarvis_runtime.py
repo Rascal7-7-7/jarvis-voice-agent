@@ -842,7 +842,23 @@ def _speak(reply: str, tl: "Timeline", hvoice) -> None:
 
         tl.mark("playback_start")
         tl.mark("first_audio_played")   # lower bound; see the docstring
+        # 出力デバイスを固定する。afplay はデバイス指定を持たず
+        # システム既定にしか出せないが、既定は安定しない
+        # （DisplayLink ドックが繰り返し奪い返す。2026-09-09 に 2 回発生し、
+        #  応答音声が数時間無音だった）。ffmpeg の audiotoolbox 出力は
+        # -audio_device_index を持つので、狙った機器へ直接流す。
+        # 失敗したら afplay（システム既定）へ落ちる。鳴らないより既定で鳴る方がよい。
+        # shared_audio と同じく遅延 import（bin/ は sys.path に載っている）
+        out_dev = audio_output = None
+        try:
+            import audio_output as _ao
+            audio_output = _ao
+            out_dev = audio_output.resolve()
+        except Exception:
+            logger.debug("output device の解決に失敗しました", exc_info=True)
         for p in paths:
+            if out_dev is not None and audio_output.play(p, out_dev):
+                continue
             play_audio_file(p)
         tl.mark("playback_end")
 

@@ -284,26 +284,36 @@ _DETACHABLE_OUTPUT = ("usb", "displaylink", "hdmi", "realtek", "dock",
 
 
 def evaluate_output(device: str | None, muted: bool | None,
-                    volume: int | None) -> Check:
-    if not device:
+                    volume: int | None, pinned: str | None = None) -> Check:
+    """出力の健全性。
+
+    ``pinned`` は JARVIS が固定している出力デバイスの UID。固定できているなら
+    システム既定がドックに奪われても影響しないので、既定に対する警告は出さない。
+    ミュートと音量 0 は固定の有無に関係なく効くので、そちらは常に警告する。
+    """
+    if not device and not pinned:
         return Check("Output", OK, "情報なし", {"available": False})
 
     data = {"available": True, "device": device, "muted": muted,
-            "volume": volume}
+            "volume": volume, "pinned": pinned}
 
     if muted:
-        return Check("Output", WARN, f"{device} / ミュート中です", data)
+        return Check("Output", WARN, f"{device or pinned} / ミュート中です", data)
 
     if volume is not None and int(volume) == 0:
-        return Check("Output", WARN, f"{device} / 音量が 0 です", data)
+        return Check("Output", WARN, f"{device or pinned} / 音量が 0 です", data)
 
-    lowered = device.lower()
+    vol = f" / 音量 {volume}" if volume is not None else ""
+
+    if pinned:
+        return Check("Output", OK, f"{pinned}（JARVIS が固定）{vol}", data)
+
+    lowered = (device or "").lower()
     if any(p in lowered for p in _DETACHABLE_OUTPUT):
         return Check("Output", WARN,
                      f"{device} — 機器が接続されていないと無音になります。"
                      "音が聞こえない場合は出力先を確認してください", data)
 
-    vol = f" / 音量 {volume}" if volume is not None else ""
     return Check("Output", OK, f"{device}{vol}", data)
 
 

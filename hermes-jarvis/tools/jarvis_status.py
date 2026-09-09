@@ -225,6 +225,18 @@ def _default_output() -> tuple[str | None, bool | None, int | None]:
     return device, muted, vol
 
 
+
+def _pinned_output() -> str | None:
+    """JARVIS が固定している出力デバイスの UID。固定していなければ None。"""
+    try:
+        sys.path.insert(0, os.path.join(PROJECT, "bin"))
+        import audio_output
+        dev = audio_output.resolve()
+        return dev["uid"] if dev else None
+    except Exception:
+        return None
+
+
 def _watchdog_events(lines: Sequence[str]) -> list[Mapping[str, Any]]:
     events = []
     for line in lines:
@@ -292,7 +304,8 @@ def collect() -> tuple[list[Check], list[dict[str, Any]]]:
     checks.append(evaluate_shared_stream(_counters))
     checks.append(evaluate_device(_counters))
     checks.append(evaluate_capture_health(generation))
-    checks.append(evaluate_output(*_default_output()))
+    _dev, _muted, _vol = _default_output()
+    checks.append(evaluate_output(_dev, _muted, _vol, _pinned_output()))
     checks.append(evaluate_startup_warm(generation))
 
     tags_status, tags = _http_get(f"{OLLAMA_URL}/api/tags")

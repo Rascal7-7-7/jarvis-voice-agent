@@ -645,3 +645,29 @@ def test_output_check_without_information_is_not_a_failure():
     chk = c.evaluate_output(None, muted=None, volume=None)
     assert chk.status == c.OK
     assert chk.data["available"] is False
+
+
+def test_output_check_shows_the_pinned_device_when_jarvis_fixes_it():
+    """JARVIS が出力先を固定している場合、システム既定ではなくそれを出す。
+
+    固定できているならドックが既定を奪っても影響しないので、
+    「既定が怪しい」警告を出す必要がない。
+    """
+    chk = c.evaluate_output("Realtek USB2.0 Audio", muted=False, volume=88,
+                            pinned="BuiltInHeadphoneOutputDevice")
+    assert chk.status == c.OK
+    assert "BuiltInHeadphoneOutputDevice" in chk.detail
+    assert chk.data["pinned"] == "BuiltInHeadphoneOutputDevice"
+
+
+def test_output_check_still_warns_on_mute_even_when_pinned():
+    chk = c.evaluate_output("外部ヘッドフォン", muted=True, volume=88,
+                            pinned="BuiltInHeadphoneOutputDevice")
+    assert chk.status == c.WARN
+    assert "ミュート" in chk.detail
+
+
+def test_output_check_warns_when_pinning_is_unavailable():
+    chk = c.evaluate_output("Realtek USB2.0 Audio", muted=False, volume=88,
+                            pinned=None)
+    assert chk.status == c.WARN
