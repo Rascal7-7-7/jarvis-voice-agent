@@ -43,6 +43,7 @@ EXCLUDE_FILE = os.path.expanduser("~/work/scripts/secretary/excluded.txt")
 INTENT_BRIEF = "BRIEF"
 INTENT_LIST = "LIST"
 INTENT_REPORTS = "REPORTS"
+INTENT_ATTENTION = "ATTENTION"
 INTENT_TEST = "TEST"
 INTENT_HISTORY = "HISTORY"
 INTENT_STATUS = "STATUS"
@@ -64,6 +65,11 @@ _REPORTS_WORDS = re.compile(r"(レポート|報告書|結果を見)")
 
 # テストの実行。「直して」は作業依頼なので含めない
 _TEST_WORDS = re.compile(r"テスト.{0,3}(走らせ|実行|回し|流し|通し)")
+
+# 対応が必要なもの。「状況」より具体的なので BRIEF より先に見る
+_ATTENTION_WORDS = re.compile(
+    r"(対応が必要|未対応|要対応|失敗して(る|いる)|"
+    r"放置され(てる|ている)|止まって(る|いる)もの|溜まって)")
 
 # 指示の履歴。
 #
@@ -241,6 +247,10 @@ def classify(utterance: str,
     names = list(projects) if projects is not None else known_projects()
     blocked = set(excluded) if excluded is not None else set(excluded_projects())
 
+    # 「対応が必要」は「状況」より具体的なので先に見る
+    if _ATTENTION_WORDS.search(text):
+        return INTENT_ATTENTION, {"action": "read"}
+
     # 履歴は BRIEF より先に見る。「指示」「履歴」は状況語より具体的
     if _HISTORY_WORDS.search(text):
         return INTENT_HISTORY, {"action": "read",
@@ -396,9 +406,15 @@ def handle(utterance: str,
         if rc != 0:
             return "状況の取得に失敗しました。"
         try:
-            return summarize_brief(json.loads(out))
+            said = summarize_brief(json.loads(out))
         except (ValueError, TypeError):
             return "状況の解析に失敗しました。"
+        # 未対応の失敗は停滞より優先して伝える。記録があっても
+        # 誰も見なければ意味がない（2026-09-09 に実際に埋もれた）
+        rc2, extra = _run_cli(["attention", "--speech"], timeout=90.0)
+        if rc2 == 0 and (extra or "").strip():
+            said = extra.strip() + said
+        return said
 
     if intent == INTENT_LIST:
         rc, out = _run_cli(["list"])
@@ -425,6 +441,13 @@ def handle(utterance: str,
         first = (out or "").strip().splitlines()
         return (f"{payload['project']} のテストを開始しました。"
                 "終わったら通知します。") if first else "テストを開始できませんでした。"
+
+    if intent == INTENT_ATTENTION:
+        rc, out = _run_cli(["attention", "--speech"], timeout=90.0)
+        if rc != 0:
+            return "対応が必要なものを取得できませんでした。"
+        said = (out or "").strip()
+        return said or "対応が必要なものはありません。"
 
     if intent == INTENT_HISTORY:
         target = payload.get("project") or "-"

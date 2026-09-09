@@ -482,3 +482,32 @@ def test_test_on_excluded_project_is_refused():
     intent, _ = js.classify("秘書、client-a のテストを走らせて",
                             projects=["client-a"], excluded=["client-a"])
     assert intent == js.INTENT_REFUSED
+
+
+# ---------------------------------------------------------------- 対応が必要なもの
+#
+# 「秘書、対応が必要なものある？」（2026-09-09 追加）
+
+
+def test_attention_intent_from_several_phrasings():
+    for t in ["秘書、対応が必要なものある", "秘書、未対応のものを教えて",
+              "秘書、失敗してるものある", "秘書、放置されてるものある"]:
+        intent, _ = js.classify(t, projects=_PROJECTS, excluded=[])
+        assert intent == js.INTENT_ATTENTION, t
+
+
+def test_attention_needs_no_project():
+    _, payload = js.classify("秘書、対応が必要なものある",
+                             projects=_PROJECTS, excluded=[])
+    assert payload["action"] == "read"
+
+
+def test_brief_words_still_win_when_no_attention_word():
+    intent, _ = js.classify("秘書、状況を教えて", projects=_PROJECTS, excluded=[])
+    assert intent == js.INTENT_BRIEF
+
+
+def test_a_project_scoped_status_is_unaffected():
+    intent, _ = js.classify("秘書、it-study の状況を教えて",
+                            projects=_PROJECTS, excluded=[])
+    assert intent == js.INTENT_STATUS
