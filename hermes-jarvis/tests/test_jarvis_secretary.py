@@ -405,3 +405,80 @@ def test_status_words_still_win_for_status():
     intent, _ = js.classify("秘書、it-study の状況を教えて",
                             projects=_PROJECTS, excluded=[])
     assert intent == js.INTENT_STATUS
+
+
+# ---------------------------------------------------------------- git 未管理
+#
+# survey は .git があるディレクトリしか見ていなかった（2026-09-09 実測で
+# Discord_bot 15,261ファイルほか3件が不可視）。読み上げにも出す。
+
+
+def test_brief_mentions_unmanaged_projects():
+    said = js.summarize_brief({
+        "projects": [{"name": "a", "stalled": False, "idle_days": 1, "dirty": 0}],
+        "unmanaged": [{"name": "Discord_bot", "files": 15261, "kind": "WORK"},
+                      {"name": "nox", "files": 408, "kind": "WORK"}],
+    })
+    assert "未管理" in said
+    assert "2" in said
+    assert "Discord_bot" in said
+
+
+def test_brief_ignores_nearly_empty_unmanaged_dirs():
+    # 実質空のディレクトリで警告を埋もれさせない
+    said = js.summarize_brief({
+        "projects": [{"name": "a", "stalled": False, "idle_days": 1, "dirty": 0}],
+        "unmanaged": [{"name": "stub", "files": 1, "kind": "EMPTY"}],
+    })
+    assert "未管理" not in said
+
+
+def test_brief_without_the_unmanaged_key_is_unchanged():
+    # 古い survey 出力でも壊れない
+    said = js.summarize_brief({
+        "projects": [{"name": "a", "stalled": False, "idle_days": 1, "dirty": 0}]})
+    assert "未管理" not in said
+    assert said
+
+
+def test_brief_speech_stays_short_with_unmanaged():
+    import jarvis_speech as sp
+    said = js.summarize_brief({
+        "projects": [{"name": "p%d" % i, "stalled": True, "idle_days": 100 + i,
+                      "dirty": 3} for i in range(20)],
+        "unmanaged": [{"name": "Discord_bot", "files": 15261, "kind": "WORK"}],
+    })
+    assert len(said) <= sp.MAX_SPOKEN_CHARS
+
+
+# ---------------------------------------------------------------- テスト実行
+#
+# 「秘書、it-study のテストを走らせて」（2026-09-09 追加）
+
+
+def test_test_intent_requires_a_project():
+    for t in ["秘書、it-study のテストを走らせて", "秘書、it-study のテスト実行",
+              "秘書、it-study のテストを回して"]:
+        intent, payload = js.classify(t, projects=_PROJECTS, excluded=[])
+        assert intent == js.INTENT_TEST, t
+        assert payload["project"] == "it-study", t
+
+
+def test_fixing_tests_is_still_a_dispatch():
+    # 「テストを直して」は作業依頼。走らせるのとは別
+    intent, payload = js.classify("秘書、it-study のテストを直して",
+                                  projects=_PROJECTS, excluded=[])
+    assert intent == js.INTENT_DISPATCH
+    assert payload["project"] == "it-study"
+
+
+def test_test_without_a_project_is_not_a_test_intent():
+    # 全プロジェクトのテストを一括で走らせるのは別の判断
+    intent, _ = js.classify("秘書、テストを走らせて", projects=_PROJECTS, excluded=[])
+    assert intent != js.INTENT_TEST
+
+
+def test_test_on_excluded_project_is_refused():
+    intent, _ = js.classify("秘書、client-a のテストを走らせて",
+                            projects=["client-a"], excluded=["client-a"])
+    assert intent == js.INTENT_REFUSED

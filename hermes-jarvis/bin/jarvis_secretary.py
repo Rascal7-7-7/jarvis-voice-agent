@@ -43,6 +43,7 @@ EXCLUDE_FILE = os.path.expanduser("~/work/scripts/secretary/excluded.txt")
 INTENT_BRIEF = "BRIEF"
 INTENT_LIST = "LIST"
 INTENT_REPORTS = "REPORTS"
+INTENT_TEST = "TEST"
 INTENT_HISTORY = "HISTORY"
 INTENT_STATUS = "STATUS"
 INTENT_SEARCH = "SEARCH"
@@ -60,6 +61,9 @@ _BRIEF_WORDS = re.compile(
     r"(状況|停滞|止まって|とまって|進捗|どうなって|残ってる|放置)")
 _LIST_WORDS = re.compile(r"(一覧|リスト|全部|どんなプロジェクト)")
 _REPORTS_WORDS = re.compile(r"(レポート|報告書|結果を見)")
+
+# テストの実行。「直して」は作業依頼なので含めない
+_TEST_WORDS = re.compile(r"テスト.{0,3}(走らせ|実行|回し|流し|通し)")
 
 # 指示の履歴。
 #
@@ -258,6 +262,12 @@ def classify(utterance: str,
         return INTENT_REPORTS, {"action": "read"}
 
     project = _find_project(text, names)
+
+    # テストの実行。**プロジェクト名が必要**（全プロジェクト一括は別の判断）。
+    # 除外の拒否は下の分岐に任せるため、ここでは blocked を見ない
+    if project and project not in blocked and _TEST_WORDS.search(text):
+        return INTENT_TEST, {"action": "read", "project": project}
+
     if project and project in blocked:
         # 完全一致で照合する。部分一致にすると別プロジェクトを巻き込む
         # （'client-a' の除外が 'client-a-nested-git-backup' を止めてはいけない）。
@@ -283,12 +293,32 @@ def classify(utterance: str,
     return INTENT_UNKNOWN, {"action": "read"}
 
 
+def _unmanaged_sentence(survey: Mapping[str, Any] | None) -> str:
+    """git 未管理を1文で足す。
+
+    survey は `.git` があるディレクトリしか見ていなかった（2026-09-09 実測で
+    Discord_bot 15,261ファイル・199MB・1日前更新ほか3件が不可視）。
+    **git に入っていない作業が最も復旧できない**ので読み上げにも出す。
+
+    実質空（`kind` が WORK でない）は数えない。空ディレクトリのノイズで
+    本当の警告が埋もれる。古い survey 出力（キーが無い）でも壊れない。
+    """
+    rows = [u for u in ((survey or {}).get("unmanaged") or [])
+            if isinstance(u, Mapping) and u.get("kind") == "WORK"]
+    if not rows:
+        return ""
+    top = max(rows, key=lambda u: int(u.get("files") or 0))
+    return (f"また、git 未管理が{len(rows)}件あります。"
+            f"最大は{top.get('name')}の{top.get('files')}ファイルです。")
+
+
 def summarize_brief(survey: Mapping[str, Any] | None) -> str:
     """survey --json を読み上げ可能な1文にする。TTS 用なので短く。"""
     projects = list((survey or {}).get("projects") or [])
     stalled = [p for p in projects if p.get("stalled")]
     if not stalled:
-        return f"停滞しているプロジェクトはありません。全{len(projects)}件を確認しました。"
+        return (f"停滞しているプロジェクトはありません。全{len(projects)}件を確認しました。"
+                + _unmanaged_sentence(survey))
     # survey.sh はコミットが 1 件も無いリポジトリに idle_days=999 を入れる。
     # これは「日数が不明」を表す番兵なので、そのまま「999日放置」と読み上げると
     # 事実と違うことを言うことになる。日数のあるものと分けて扱う。
@@ -302,7 +332,7 @@ def summarize_brief(survey: Mapping[str, Any] | None) -> str:
                  f"未コミット{worst.get('dirty')}件です。")
     if never:
         head += f"うち{len(never)}件はまだ一度もコミットされていません。"
-    return head
+    return head + _unmanaged_sentence(survey)
 
 
 # ---------------------------------------------------------------- execution
@@ -384,6 +414,17 @@ def handle(utterance: str,
         n = len([l for l in out.splitlines() if l.strip().endswith(".md")])
         return (f"レポートは{n}件あります。" if n
                 else "レポートはまだありません。")
+
+    if intent == INTENT_TEST:
+        # テストは分単位かかる（it-study は 48s）。待たせずに投げて
+        # 完了は通知で知らせる。曖昧なら secretary 側が走らせずに拒否する
+        rc, out = _run_cli(["test", "--bg", payload["project"]], timeout=30.0)
+        if rc != 0:
+            return (f"{payload['project']} のテストコマンドが決まっていません。"
+                    "画面で確認してください。")
+        first = (out or "").strip().splitlines()
+        return (f"{payload['project']} のテストを開始しました。"
+                "終わったら通知します。") if first else "テストを開始できませんでした。"
 
     if intent == INTENT_HISTORY:
         target = payload.get("project") or "-"

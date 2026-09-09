@@ -877,3 +877,28 @@ LLM はこの宛先を発明できない。
 
 判定の順は HISTORY → STATUS/BRIEF → 除外の拒否 → DISPATCH → SEARCH。
 `履歴` は `状況` より具体的なので先に見る。
+
+## テスト実行と git 未管理の読み上げ（2026-09-09）
+
+### `INTENT_TEST`
+
+`秘書、it-study のテストを走らせて` で `secretary test --bg` を呼ぶ。
+
+    秘書、it-study のテストを走らせて  -> TEST     （バックグラウンド + 完了通知）
+    秘書、it-study のテストを直して    -> DISPATCH （作業依頼のまま）
+    秘書、テストを走らせて             -> TEST ではない（プロジェクト名が必要）
+    秘書、client-a のテストを走らせて  -> REFUSED
+
+`_TEST_WORDS` は `走らせ|実行|回し|流し|通し` のみ。`直し` は含めない。
+テストは分単位かかる（it-study は 48s）ので待たせず、
+完了は ① の `notify_done` で知らせる。
+`toolchain` が曖昧と判断した場合は `secretary` 側が走らせずに拒否する。
+
+### `summarize_brief` が git 未管理を報告する
+
+    停滞は4件です。最長はAi_Createで144日放置、未コミット1件です。
+    また、git 未管理が3件あります。最大はDiscord_botの15261ファイルです。
+
+`survey --json` に `unmanaged` キーが増えたのを読む。`kind` が `WORK` の
+ものだけ数える（実質空のディレクトリで警告を埋もれさせない）。
+キーが無い古い出力でも壊れない。
