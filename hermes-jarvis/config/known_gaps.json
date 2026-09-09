@@ -10,11 +10,6 @@
       "id": "CLAMSHELL_RECOVERY",
       "status": "UNREACHABLE_IN_CURRENT_CONFIG",
       "note": "Recovery from a clamshell sleep/wake cycle has still never been observed -- and 2026-09-09 measurement shows why: this machine does not sleep. `pmset -g custom` reports `sleep 0` for AC Power (and `displaysleep 0`), Amphetamine held PreventUserIdleSystemSleep for 21h40m, and `pmset -g log` reported `Total Sleep/Wakes since boot at 2026-09-08 19:38:41 +0900 :0` -- zero cycles since the reboot that started this runtime. The user works clamshell on AC through a DisplayLink dock, so idle sleep never fires. This gap was previously ranked low as 'never observed'; it was then briefly ranked HIGH on the assumption that clamshell operation exercises it, which was wrong -- clamshell operation on AC actively prevents it. Re-ranked LOW. It becomes reachable only if the machine runs on battery and sleeps, or if the power configuration changes. jarvis-status now surfaces this precondition in the Power row so the next attempt does not re-derive it."
-    },
-    {
-      "id": "EARLY_TURN_DURING_WARM",
-      "status": "UNVERIFIED",
-      "note": "A turn started while the startup warm is still retrying is unmeasured. Argued safe -- Ollama serves one runner per model -- but not observed. 2026-09-09: the real login/warm validation had a 35s readiness wait plus model load to 20:56, which would have been the window, but the turn was deliberately held until warm completed so the latency measurement stayed clean. Still unobserved."
     }
   ]
 }

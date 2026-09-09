@@ -569,3 +569,61 @@ EARLY_TURN_DURING_WARM = UNVERIFIED
 あったが、レイテンシ測定を汚さないため意図的にターンを止めたので未観測のまま。
 
 tests: `test_jarvis_status.py` 88 → 94件。
+
+---
+
+## 変更11: EARLY_TURN_DURING_WARM を実測で閉じた
+
+### gap の主張
+「startup warm が retry / モデルロード中にターンを開始した場合が未計測。
+Ollama はモデルごとに 1 runner なので安全と論じられているが未観測」
+
+### 発話なしで検証する
+`jarvis-dispatch` を直接叩けば、router と backend が同じ Ollama を叩くので
+**発話を必要とせず同じ競合を再現できる**。ユーザーの手を借りずに測れる。
+
+### 試行1（設計が不正確だった）
+ollama を完全に停止したまま runtime を起動 → dispatch。
+```
+dispatch 所要 23.2s → "API call failed after 3 retries: Connection error."
+```
+これは「backend 不在でのターン」を測っており、gap が問う
+「**warm が動いている最中**のターン」ではない。設計をやり直した。
+
+### 試行2（bind 競合を狙った）
+ollama を止めて runtime を起動し、すぐ ollama を戻す。
+```
+dispatch 所要 29.9s → "今日の日付は2026年9月9日です。"（成功）
+readiness attempts = 0
+```
+ollama が 2 秒で bind したため retry 窓に入らなかった。窓が狭すぎる。
+
+### 試行3（モデルロード窓を狙った — これが本質）
+`keep_alive:0` でモデルを unload してから runtime を再起動。
+readiness は即 OK になり、warm は**モデルロード**に入る。その 16 秒の窓で dispatch。
+
+```
+18:46:29.597  ollama startup readiness: ready after=0.0s attempts=1
+18:46:30      dispatch 開始                    ┐
+18:46:46.373  ollama warm (startup): ready in 16.78s, keep_alive=60m   │ 重複 16 秒
+18:47:10      dispatch 完了（39.8s）           ┘
+```
+
+**結果: 両方成功。**
+- warm は 16.78s で正常完了（abandon せず）
+- dispatch は正答を返した（`今日の日付は2026年9月9日です。`）
+- `expires=19:47:10` → keep_alive 60m が正しく武装
+- `jarvis-status = HEALTHY`
+
+→ 「Ollama はモデルごとに 1 runner なので安全」という論証が**実測で裏付けられた**。
+warm とターンが同じ runner を共有しても、片方が壊れることはない。
+代償はターン側の待ち時間（39.8s）で、モデルロードを待たされる分そのまま伸びる。
+
+`known_gaps.json` から削除。3件 → 2件。
+
+### 実験で自分が壊したもの（復旧済み）
+- `wc -l` の先頭空白で `tail -n +$MARK` が `Invalid argument` になり監視ループが空回りした
+  → `tr -d ' '` を追加
+- ollama を bootout したまま runtime を起動したため
+  `Startup warm ! abandoned after 41.1s / 11 attempts` を意図的に発生させた
+  → ollama を bootstrap して復旧（2 秒で復帰）、その後 HEALTHY を確認
