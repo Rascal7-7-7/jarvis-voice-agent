@@ -43,6 +43,7 @@ EXCLUDE_FILE = os.path.expanduser("~/work/scripts/secretary/excluded.txt")
 INTENT_BRIEF = "BRIEF"
 INTENT_LIST = "LIST"
 INTENT_REPORTS = "REPORTS"
+INTENT_STATUS = "STATUS"
 INTENT_SEARCH = "SEARCH"
 INTENT_DISPATCH = "DISPATCH"
 INTENT_UNKNOWN = "UNKNOWN"
@@ -228,6 +229,14 @@ def classify(utterance: str,
     blocked = set(excluded) if excluded is not None else set(excluded_projects())
 
     if _BRIEF_WORDS.search(text):
+        # プロジェクト名があればそこに絞る。無ければ従来どおり全体ブリーフ。
+        #
+        # 除外プロジェクトでも状態は返す。「状態は把握したいが手は出させたくない」
+        # という区別で、survey が除外プロジェクトも表示し続けるのと同じ扱い。
+        # パスと commit 件名は status.py 側で withhold する。
+        scoped = _find_project(text, names)
+        if scoped:
+            return INTENT_STATUS, {"action": "read", "project": scoped}
         return INTENT_BRIEF, {"action": "read"}
     if _LIST_WORDS.search(text):
         return INTENT_LIST, {"action": "read"}
@@ -361,6 +370,15 @@ def handle(utterance: str,
         n = len([l for l in out.splitlines() if l.strip().endswith(".md")])
         return (f"レポートは{n}件あります。" if n
                 else "レポートはまだありません。")
+
+    if intent == INTENT_STATUS:
+        rc, out = _run_cli(["status", "--speech", payload["project"]],
+                           timeout=30.0)
+        if rc != 0:
+            return f"{payload['project']} の状態を取得できませんでした。"
+        said = (out or "").strip()
+        # パスを読み上げても意味がない（search で確認済み）。詳細は画面で見る。
+        return said or f"{payload['project']} の状態を取得できませんでした。"
 
     if intent == INTENT_SEARCH:
         rc, out = _run_cli(["search", "--json", payload["query"]], timeout=60.0)

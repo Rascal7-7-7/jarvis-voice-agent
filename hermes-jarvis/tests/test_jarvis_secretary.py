@@ -331,3 +331,38 @@ def test_search_query_of_one_char_is_unknown():
 def test_brief_words_still_win_over_search():
     intent, _ = js.classify("秘書、状況を教えて", projects=["alpha"], excluded=[])
     assert intent == js.INTENT_BRIEF
+
+
+# ---------------------------------------------------------------- 単体の状態
+#
+# 「秘書、it-study の状況」— 1プロジェクトに絞る（2026-09-09 追加）
+
+
+def test_status_intent_when_a_project_is_named():
+    intent, payload = js.classify("秘書、it-study の状況を教えて",
+                                  projects=_PROJECTS, excluded=[])
+    assert intent == js.INTENT_STATUS
+    assert payload["project"] == "it-study"
+    assert payload["action"] == "read"
+
+
+def test_global_brief_when_no_project_is_named():
+    # 既存挙動。プロジェクト名が無ければ全体ブリーフのまま
+    intent, _ = js.classify("秘書、状況を教えて", projects=_PROJECTS, excluded=[])
+    assert intent == js.INTENT_BRIEF
+
+
+def test_status_on_excluded_project_is_allowed_but_redacted():
+    # 「状態は把握したいが手は出させたくない」— survey と同じ扱い。
+    # パスと commit 件名は status.py 側で withhold する
+    intent, payload = js.classify("秘書、client-a の状況",
+                                  projects=["client-a"], excluded=["client-a"])
+    assert intent == js.INTENT_STATUS
+    assert payload["project"] == "client-a"
+
+
+def test_dispatch_still_wins_without_brief_words():
+    intent, payload = js.classify("秘書、it-study のテストを直して",
+                                  projects=_PROJECTS, excluded=[])
+    assert intent == js.INTENT_DISPATCH
+    assert payload["project"] == "it-study"
