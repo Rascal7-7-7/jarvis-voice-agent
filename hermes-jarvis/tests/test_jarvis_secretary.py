@@ -225,3 +225,64 @@ def test_read_instructions_do_not_ask_for_confirmation():
     for u in ("秘書、状況を教えて", "秘書、レポートを見せて"):
         _intent, payload = js.classify(u, projects=["it-study"])
         assert payload["action"] == "read"
+
+
+# ------------------------------------------------------- 作業対象外の強制
+#
+# 2026-09-09 ユーザー指示: client-a（業務データ（取扱いに配慮が必要な情報を含む））は
+# 秘書に触らせない。
+#
+# **記憶ではなくコードで止める。** 意図は忘れられるが決定的な判定は忘れない。
+# 音声経路にも同じ境界を入れる。CLI 側だけ守っても、発話から抜けられては意味がない。
+#
+# 読み取り（状況確認）は許す。状態は把握したいが手は出させたくない、という区別。
+
+def test_excluded_project_is_refused_for_dispatch():
+    intent, payload = js.classify("秘書、client-a の未コミットを整理して",
+                                  projects=["client-a", "it-study"],
+                                  excluded=["client-a"])
+    assert intent == js.INTENT_REFUSED
+    assert payload["project"] == "client-a"
+
+
+def test_a_non_excluded_project_still_dispatches():
+    intent, payload = js.classify("秘書、it-study の未コミットを整理して",
+                                  projects=["client-a", "it-study"],
+                                  excluded=["client-a"])
+    assert intent == js.INTENT_DISPATCH
+    assert payload["project"] == "it-study"
+
+
+def test_exclusion_is_exact_match_not_substring():
+    """部分一致にすると別プロジェクトを巻き込む。
+
+    'client-a' の除外が 'client-a-nested-git-backup' まで止めてはいけない。
+    """
+    intent, payload = js.classify(
+        "秘書、client-a-nested-git-backup の状態を調べて",
+        projects=["client-a", "client-a-nested-git-backup"],
+        excluded=["client-a"])
+    assert intent == js.INTENT_DISPATCH
+    assert payload["project"] == "client-a-nested-git-backup"
+
+
+def test_read_intents_are_not_blocked_by_exclusion():
+    """読み取りは止めない。状態は把握したい。"""
+    intent, payload = js.classify("秘書、状況を教えて",
+                                  projects=["client-a"], excluded=["client-a"])
+    assert intent == js.INTENT_BRIEF
+    assert payload["action"] == "read"
+
+
+def test_the_refusal_says_why():
+    reply = js.handle("秘書、client-a を整理して",
+                      projects=["client-a"], excluded=["client-a"])
+    assert "client-a" in reply
+    assert "対象外" in reply
+
+
+def test_excluded_list_is_read_from_the_file_by_default():
+    names = js.excluded_projects()
+    assert "client-a" in names
+    # コメント行や空行を拾っていないこと
+    assert all(n and not n.startswith("#") for n in names)

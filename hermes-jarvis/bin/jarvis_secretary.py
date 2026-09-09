@@ -38,12 +38,14 @@ from typing import Any, Iterable, Mapping
 
 SECRETARY_CLI = os.path.expanduser("~/work/scripts/secretary/secretary")
 WORK_DIR = os.path.expanduser("~/work")
+EXCLUDE_FILE = os.path.expanduser("~/work/scripts/secretary/excluded.txt")
 
 INTENT_BRIEF = "BRIEF"
 INTENT_LIST = "LIST"
 INTENT_REPORTS = "REPORTS"
 INTENT_DISPATCH = "DISPATCH"
 INTENT_UNKNOWN = "UNKNOWN"
+INTENT_REFUSED = "REFUSED"
 
 # survey.sh がコミット 0 件のリポジトリに入れる番兵値
 _NO_COMMIT_DAYS = 999
@@ -149,6 +151,25 @@ def matches(utterance: str | None) -> bool:
     return bool(TRIGGER.search(utterance))
 
 
+def excluded_projects(path: str = EXCLUDE_FILE) -> list[str]:
+    """秘書が作業してはいけないプロジェクト名。
+
+    CLI 側（``secretary``）と**同じファイル**を読む。2箇所で別々に持つと必ず
+    片方だけ更新されて穴が開く。記憶ではなくファイルにするのは、
+    意図は忘れられるが決定的な判定は忘れないため。
+    """
+    names: list[str] = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if line:
+                    names.append(line)
+    except OSError:
+        return []
+    return names
+
+
 def known_projects(work_dir: str = WORK_DIR) -> list[str]:
     """~/work 直下のプロジェクト名。設定ではなく実体から取る。"""
     skip = {"_assets", "logs", "scripts"}
@@ -174,7 +195,8 @@ def _find_project(utterance: str, projects: Iterable[str]) -> str | None:
 
 
 def classify(utterance: str,
-             projects: Iterable[str] | None = None) -> tuple[str, dict[str, Any]]:
+             projects: Iterable[str] | None = None,
+             excluded: Iterable[str] | None = None) -> tuple[str, dict[str, Any]]:
     """発話を秘書の意図に落とす。すべて決定的で、モデルを使わない。
 
     返り値の ``action`` が実行方針:
@@ -183,6 +205,7 @@ def classify(utterance: str,
     """
     text = utterance or ""
     names = list(projects) if projects is not None else known_projects()
+    blocked = set(excluded) if excluded is not None else set(excluded_projects())
 
     if _BRIEF_WORDS.search(text):
         return INTENT_BRIEF, {"action": "read"}
@@ -192,6 +215,10 @@ def classify(utterance: str,
         return INTENT_REPORTS, {"action": "read"}
 
     project = _find_project(text, names)
+    if project and project in blocked:
+        # 完全一致で照合する。部分一致にすると別プロジェクトを巻き込む
+        # （'client-a' の除外が 'client-a-nested-git-backup' を止めてはいけない）。
+        return INTENT_REFUSED, {"action": "refuse", "project": project}
     if project:
         # プロジェクト名とトリガ語を落として指示本文にする
         instruction = TRIGGER.sub("", text)
@@ -249,7 +276,8 @@ def _run_cli(args: list[str], timeout: float = 30.0) -> tuple[int, str]:
 
 
 def handle(utterance: str,
-           projects: Iterable[str] | None = None) -> str:
+           projects: Iterable[str] | None = None,
+           excluded: Iterable[str] | None = None) -> str:
     """発話を処理して、読み上げる文を返す。
 
     書き込みは行わない。dispatch はキュー登録までで止める。
@@ -274,7 +302,12 @@ def handle(utterance: str,
         # どちらでもない発話は確認を保持したまま、通常処理へ進む。
         # 「秘書、状況を教えて」で確認が消えるのは不便なので消さない。
 
-    intent, payload = classify(utterance, projects=projects)
+    intent, payload = classify(utterance, projects=projects,
+                               excluded=excluded)
+
+    if intent == INTENT_REFUSED:
+        return (f"{payload['project']} は秘書の作業対象外に設定されています。"
+                "状況の確認はできますが、作業の指示は受け付けません。")
 
     if intent == INTENT_BRIEF:
         rc, out = _run_cli(["survey", "--json"])
