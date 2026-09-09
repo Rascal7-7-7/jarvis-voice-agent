@@ -15,6 +15,7 @@
 !/jarvis-ack-helper/
 !/jarvis-activate/
 !/jarvis-validation-evidence/
+!/jarvis-wake-benchmark/
 
 # ── hermes-jarvis 内の除外
 # src/ は上流 hermes-agent v2026.8.27 の pin 済みコピーで、それ自体が git repo（317MB）。
@@ -46,3 +47,11 @@ hermes-jarvis/tts-samples/
 **/.venv/
 **/.pytest_cache/
 .DS_Store
+
+# ── jarvis-wake-benchmark は harness と docs のみ追跡する
+#    corpus/ は TTS 生成物と実環境音（再生成できる。音声は git に入れない）
+#    taps/ results/ rollback/ control-audio/ は過去の実測アーティファクト
+jarvis-wake-benchmark/*
+!jarvis-wake-benchmark/harness/
+!jarvis-wake-benchmark/docs/
+jarvis-wake-benchmark/harness/corpus/
