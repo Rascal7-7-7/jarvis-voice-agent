@@ -43,6 +43,7 @@ EXCLUDE_FILE = os.path.expanduser("~/work/scripts/secretary/excluded.txt")
 INTENT_BRIEF = "BRIEF"
 INTENT_LIST = "LIST"
 INTENT_REPORTS = "REPORTS"
+INTENT_HISTORY = "HISTORY"
 INTENT_STATUS = "STATUS"
 INTENT_SEARCH = "SEARCH"
 INTENT_DISPATCH = "DISPATCH"
@@ -59,6 +60,14 @@ _BRIEF_WORDS = re.compile(
     r"(状況|停滞|止まって|とまって|進捗|どうなって|残ってる|放置)")
 _LIST_WORDS = re.compile(r"(一覧|リスト|全部|どんなプロジェクト)")
 _REPORTS_WORDS = re.compile(r"(レポート|報告書|結果を見)")
+
+# 指示の履歴。
+#
+# 「指示」単独では発火させない。「指示ファイルを作って」は履歴の
+# 問い合わせではなく作業依頼なので、疑問・履歴の形を要求する。
+_HISTORY_WORDS = re.compile(
+    r"(履歴|何を指示|何を頼|何をやらせ|何を投げ|"
+    r"前回.{0,6}(指示|頼|投げ)|指示.{0,4}(一覧|履歴))")
 
 # 横断検索。**プロジェクト名が無いときだけ**使う（下の classify を参照）
 _SEARCH_WORDS = re.compile(
@@ -228,6 +237,11 @@ def classify(utterance: str,
     names = list(projects) if projects is not None else known_projects()
     blocked = set(excluded) if excluded is not None else set(excluded_projects())
 
+    # 履歴は BRIEF より先に見る。「指示」「履歴」は状況語より具体的
+    if _HISTORY_WORDS.search(text):
+        return INTENT_HISTORY, {"action": "read",
+                                "project": _find_project(text, names)}
+
     if _BRIEF_WORDS.search(text):
         # プロジェクト名があればそこに絞る。無ければ従来どおり全体ブリーフ。
         #
@@ -370,6 +384,13 @@ def handle(utterance: str,
         n = len([l for l in out.splitlines() if l.strip().endswith(".md")])
         return (f"レポートは{n}件あります。" if n
                 else "レポートはまだありません。")
+
+    if intent == INTENT_HISTORY:
+        target = payload.get("project") or "-"
+        rc, out = _run_cli(["history", "--speech", target], timeout=30.0)
+        if rc != 0:
+            return "指示の履歴を取得できませんでした。"
+        return (out or "").strip() or "指示の履歴を取得できませんでした。"
 
     if intent == INTENT_STATUS:
         rc, out = _run_cli(["status", "--speech", payload["project"]],

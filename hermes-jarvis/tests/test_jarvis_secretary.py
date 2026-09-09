@@ -366,3 +366,42 @@ def test_dispatch_still_wins_without_brief_words():
                                   projects=_PROJECTS, excluded=[])
     assert intent == js.INTENT_DISPATCH
     assert payload["project"] == "it-study"
+
+
+# ---------------------------------------------------------------- 記憶
+#
+# 「秘書、it-study に何を指示した？」（2026-09-09 追加）
+
+
+def test_history_intent_from_several_phrasings():
+    for t in ["秘書、it-study に何を指示した", "秘書、指示の履歴を見せて",
+              "秘書、前回何を頼んだ", "秘書、履歴"]:
+        intent, _ = js.classify(t, projects=_PROJECTS, excluded=[])
+        assert intent == js.INTENT_HISTORY, t
+
+
+def test_history_scopes_to_the_named_project():
+    _, payload = js.classify("秘書、it-study に何を指示した",
+                             projects=_PROJECTS, excluded=[])
+    assert payload["project"] == "it-study"
+    assert payload["action"] == "read"
+
+
+def test_history_without_a_project_is_global():
+    _, payload = js.classify("秘書、指示の履歴を見せて",
+                             projects=_PROJECTS, excluded=[])
+    assert payload["project"] is None
+
+
+def test_the_word_shiji_alone_is_not_history():
+    # 「指示ファイルを作って」は履歴の問い合わせではなく作業依頼
+    intent, payload = js.classify("秘書、it-study に指示ファイルを作って",
+                                  projects=_PROJECTS, excluded=[])
+    assert intent == js.INTENT_DISPATCH
+    assert payload["project"] == "it-study"
+
+
+def test_status_words_still_win_for_status():
+    intent, _ = js.classify("秘書、it-study の状況を教えて",
+                            projects=_PROJECTS, excluded=[])
+    assert intent == js.INTENT_STATUS
