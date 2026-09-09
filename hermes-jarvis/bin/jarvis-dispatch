@@ -70,6 +70,46 @@ print(s.handle(sys.argv[1]))
 ' "$UTTERANCE" 2>/dev/null) || {
       print "秘書を利用できませんでした。"; exit 0
     }
+    # 決定的モジュールの出力は C8（LLM 要約）へ流さずそのまま読み上げる。
+    # 2026-09-09 実測: 「システム設定を開いて」の拒否
+    # 「それは開けません。開けるのは…です。」が C8 を通ると
+    # 「アクセスできるウェブサイトは…7つです。詳細も読み上げますか？」に
+    # 書き換わった。アプリを「ウェブサイト」と言い換え、無い選択肢を提示していた。
+    # 確認を求める発話が書き換わると、ユーザーは実際と違う説明に同意することになる。
+    print -r -- "$out" | "$PY" -c '
+import sys, os
+sys.path.insert(0, os.path.expanduser("~/AI-Lab/hermes-jarvis/bin"))
+import jarvis_speech as sp
+print(sp.sanitize(sys.stdin.read()))
+'
+    exit 0
+    ;;
+  OPEN)
+    # SECRETARY と同じく決定的 override のみで到達する（LABELS に無い）。
+    # 何を開くかは jarvis_open.TARGETS の許可リストが決め、
+    # 載っていない対象は開かずに拒否する。open へ渡す値は必ず許可リスト由来で、
+    # 発話の文字列は値に混ざらない。
+    out=$("$PY" -c '
+import sys, os
+sys.path.insert(0, os.path.expanduser("~/AI-Lab/hermes-jarvis/bin"))
+import jarvis_open as o
+print(o.handle(sys.argv[1]))
+' "$UTTERANCE" 2>/dev/null) || {
+      print "開く操作を実行できませんでした。"; exit 0
+    }
+    # 決定的モジュールの出力は C8（LLM 要約）へ流さずそのまま読み上げる。
+    # 2026-09-09 実測: 「システム設定を開いて」の拒否
+    # 「それは開けません。開けるのは…です。」が C8 を通ると
+    # 「アクセスできるウェブサイトは…7つです。詳細も読み上げますか？」に
+    # 書き換わった。アプリを「ウェブサイト」と言い換え、無い選択肢を提示していた。
+    # 確認を求める発話が書き換わると、ユーザーは実際と違う説明に同意することになる。
+    print -r -- "$out" | "$PY" -c '
+import sys, os
+sys.path.insert(0, os.path.expanduser("~/AI-Lab/hermes-jarvis/bin"))
+import jarvis_speech as sp
+print(sp.sanitize(sys.stdin.read()))
+'
+    exit 0
     ;;
   CODEX)
     out=$("$BIN/jarvis-codex" "$WORKDIR" "$UTTERANCE 日本語で簡潔に。" 2>/dev/null) || {

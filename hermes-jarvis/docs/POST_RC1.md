@@ -708,3 +708,50 @@ secretary dispatch --codex tradingview-mcp '未コミット差分を確認し2�
 secretary dispatch --headless <project> "<指示>"   claude --print
 secretary dispatch --codex    <project> "<指示>"   codex exec
 ```
+
+## 「〜を開いて」— アプリと URL（2026-09-09）
+
+`bin/jarvis_open.py` を追加。router に `OPEN` override、dispatch に `OPEN)` 分岐。
+
+### 境界は許可リスト
+
+`OPEN` は **`LABELS` に入れていない**（`SECRETARY` と同じ）。LLM はこの宛先を
+発明できない。router の override は「開いて と言われた」ことしか判定せず、
+何を開くかは `jarvis_open.TARGETS` が決める。載っていない対象は開かずに拒否する。
+
+- `open` に渡す値は**必ず TARGETS 由来**。発話の文字列を値に混ぜない
+- `subprocess` は list 形式。shell を経由しない
+- 現在の対象: Brave / Chrome / Safari（アプリ）、Google / YouTube / GitHub / X（URL）
+- **システム設定・ターミナルは意図的に載せていない**。ウィンドウを開くだけでも
+  そこから先は設定変更の入口になる
+- URL は既定ブラウザで開く（この機では `com.brave.browser`）。
+  JARVIS 側でブラウザを決め打ちせず、ユーザーの既定に従う
+- trigger のパターンは `jarvis_open.TRIGGER` を router が借りる。
+  2箇所に持つと片方だけ直して穴が開く
+
+### 実測して直したもの
+
+**1. `起動して` が「再起動して」に誤爆した。**
+`(?<!再)` を入れる前は「Macを再起動して」が OPEN へ流れた。gate が捕まえるのは
+`route_dataset.py:80` の「sudoで再起動して」だけで、「Macを再起動して」は素通りする。
+除外後は従来どおり LOCAL_TOOL（LLM 判断）へ戻った。
+
+**2. C8（LLM 要約）が決定的な発話を書き換えていた。**
+「システム設定を開いて」の拒否
+「それは開けません。開けるのはBrave、…、Xです。」が C8 を通ると
+「アクセスできるウェブサイトは…7つです。詳細も読み上げますか？」になった。
+アプリを「ウェブサイト」と言い換え、無い選択肢（詳細の読み上げ）を提示していた。
+
+`OPEN` と **`SECRETARY`** の両方を C8 の手前で `exit 0` させた。SECRETARY は
+確認を求める発話（`〜を実行しますか？`）を返すことがあり、それが書き換わると
+ユーザーは実際と違う説明に同意することになる。どちらの経路も出力は
+`jarvis_speech.sanitize()` だけを通す。
+
+計測: `jarvis-dispatch "グーグルを開いて"` は 0.24s（LLM を通らない）。
+
+### テスト
+
+`tests/test_jarvis_open.py` 19 件。CI のハードウェア非依存スイートに追加済み
+（合計 207 件）。router のテストは `route()` を呼ばず `_OVERRIDES` を直接見る
+（override に当たらない発話は LLM 経路まで落ちるので、ollama の無い CI では
+待たされるだけで何も確かめられない）。

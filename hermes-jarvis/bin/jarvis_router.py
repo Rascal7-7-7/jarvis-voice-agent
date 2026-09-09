@@ -27,7 +27,8 @@ import time
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import jarvis_gate  # noqa: E402
+import jarvis_gate
+import jarvis_open  # noqa: E402
 
 OLLAMA = os.environ.get("JARVIS_OLLAMA", "http://127.0.0.1:11434/v1/chat/completions")
 MODEL = os.environ.get("JARVIS_ROUTER_MODEL", "gemma4:e2b")
@@ -134,6 +135,13 @@ _OVERRIDES = (
     ("CLAUDE", re.compile(r"(クロード|claude)", re.IGNORECASE)),
     ("WEB", re.compile(r"(ウェブで|webで|ネットで|検索して|ググって|クロームで|chromeで)", re.IGNORECASE)),
     ("LOCAL", re.compile(r"(ローカルだけ|ローカルで答え|オフラインで)", re.IGNORECASE)),
+    # OPEN も SECRETARY と同じ扱い。**LABELS には入れない**ので LLM は選べない。
+    # ここは「開いて と言われた」ことしか判定せず、何を開くかは
+    # jarvis_open.TARGETS の許可リストが決める。載っていなければ開かない。
+    # CODEX / CLAUDE より後ろに置いてあるのは意図的で、
+    # 「クロードを開いて」は従来どおり CLAUDE へ流す（既存挙動を壊さない）。
+    # パターンは jarvis_open から借りる。2箇所に持つと片方だけ直して穴が開く
+    ("OPEN", jarvis_open.TRIGGER),
 )
 
 # ---- step 2b: high-precision deterministic fast paths.

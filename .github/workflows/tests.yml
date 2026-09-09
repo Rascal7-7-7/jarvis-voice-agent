@@ -45,7 +45,8 @@ jobs:
             test_jarvis_secretary.py \
             test_jarvis_status.py \
             test_noise_floor.py \
-            test_replacement_counter.py
+            test_replacement_counter.py \
+            test_jarvis_open.py
 
       - name: 設定ファイルが壊れていないか
         run: |
