@@ -270,6 +270,38 @@ def evaluate_shared_stream(counters: Mapping[str, Any] | None) -> Check:
     return Check("Audio", OK, summary, data)
 
 
+# ------------------------------------------------------------------ device
+#
+# 案C: 優先順位（外部 > 無線 > 内蔵）で選んだデバイスと実際の束縛先が食い違ったら
+# 知らせる。稼働中のストリームは差し替えない（CoreAudio の close→reopen が
+# デッドロックするため）ので、切り替えには runtime 再起動が必要。
+# 「何が起きていて、どうすれば直るか」まで出す。
+
+
+def evaluate_device(counters: Mapping[str, Any] | None) -> Check:
+    if not counters or "bound_device" not in counters:
+        return Check("Device", OK, "情報なし", {"available": False})
+
+    bound = counters.get("bound_device")
+    preferred = counters.get("preferred_device")
+    pending = bool(counters.get("device_change_pending"))
+    data = {"available": True, "bound_device": bound,
+            "preferred_device": preferred, "pending": pending}
+
+    if preferred is None:
+        return Check("Device", WARN,
+                     f"束縛中 {bound!r} / 選択可能な候補がありません"
+                     "（クラムシェル中に外部マイクを抜いた等）", data)
+
+    if pending:
+        return Check("Device", WARN,
+                     f"優先デバイスが {preferred!r} に変わりました"
+                     f"（束縛中は {bound!r}）。切り替えには runtime の再起動が必要です",
+                     data)
+
+    return Check("Device", OK, f"{bound}", data)
+
+
 # ----------------------------------------------------------- capture health
 #
 # 2026-09-08/09 の実測で3つの失敗モードを踏んだ。いずれも既にログには出ていたが

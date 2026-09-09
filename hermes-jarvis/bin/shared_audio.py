@@ -40,6 +40,8 @@ cap, frame accounting) is untouched upstream code, driven exactly as before.
 from __future__ import annotations
 
 from collections import deque
+
+import audio_devices
 from statistics import median
 
 import logging
@@ -169,6 +171,10 @@ class SharedAudioInput:
         self._floor_stride = 4      # 4 チャンクに 1 回だけ測る（callback を軽く保つ）
         self._floor_tick = 0
         self.silence_threshold = _FLOOR_MIN_THRESHOLD
+        # 案C: デバイス優先順位。bound は実際に開いた先、preferred は今選ぶべき先。
+        self.bound_device: str | None = None
+        self.preferred_device: str | None = None
+        self.device_change_pending = False
         self.engine_frames_fed = 0
         self.feed_errors = 0
         self.replacements = 0
@@ -200,6 +206,59 @@ class SharedAudioInput:
 
     # ---- stream lifecycle (startup and recovery ONLY) ----------------------
 
+    def select_input_device(self, sd) -> dict | None:
+        """優先順位（外部 > 無線 > 内蔵）で入力デバイスを選び、開く先を誘導する。
+
+        ``sd.default.device`` を**プロセスローカルに**設定する。upstream の
+        ``sd.InputStream(...)`` は ``device=`` を渡していないので、これで開く先が
+        決まる。ユーザーのシステム既定入力は変更しない。
+
+        クラムシェル中は内蔵マイクを候補から外す（列挙されるが全ゼロを返すため）。
+        候補が無ければ何もせず None を返し、OS 既定に委ねる。
+        """
+        clamshell = audio_devices.read_clamshell_state()
+        chosen = audio_devices.select(audio_devices.enumerate_inputs(sd),
+                                      clamshell_closed=clamshell)
+        if chosen is None:
+            logger.warning("shared audio: 選択可能な入力デバイスがありません "
+                           "(clamshell_closed=%s)。OS 既定に委ねます", clamshell)
+            self.preferred_device = None
+            return None
+        self.preferred_device = chosen["name"]
+        try:
+            current = sd.default.device
+            output = current[1] if isinstance(current, (list, tuple)) else None
+            sd.default.device = (chosen["index"], output)
+        except Exception:
+            logger.exception("shared audio: sd.default.device の設定に失敗しました")
+            return chosen
+        logger.info("shared audio: input device = %r (tier %d, index %d, "
+                    "clamshell_closed=%s)",
+                    chosen["name"], chosen["tier"], chosen["index"], clamshell)
+        return chosen
+
+    def refresh_preferred_device(self, sd) -> bool:
+        """今選ぶべきデバイスを再評価する。束縛先と食い違えば True。
+
+        ここでストリームを差し替えることはしない。差し替えは CoreAudio の
+        close→reopen デッドロックを踏む唯一の経路であり、稼働中の健全な
+        ストリームに対して行ってはいけない（open_once のコメント参照）。
+        切り替えは runtime の再起動で行う。
+        """
+        clamshell = audio_devices.read_clamshell_state()
+        chosen = audio_devices.select(audio_devices.enumerate_inputs(sd),
+                                      clamshell_closed=clamshell)
+        self.preferred_device = chosen["name"] if chosen else None
+        pending = bool(self.preferred_device and self.bound_device
+                       and self.preferred_device != self.bound_device)
+        if pending and not self.device_change_pending:
+            logger.warning(
+                "shared audio: 優先デバイスが変わりました %r -> %r。"
+                "切り替えには runtime の再起動が必要です",
+                self.bound_device, self.preferred_device)
+        self.device_change_pending = pending
+        return pending
+
     def open_once(self) -> bool:
         """Open and start the one physical stream. Called once, at startup.
 
@@ -208,6 +267,9 @@ class SharedAudioInput:
         the device-identity fingerprint all stay upstream's.
         """
         sd, _np = self._vm._import_audio()
+        # 案C: 開く前に優先順位でデバイスを決める。upstream は「OS 既定」を開くが、
+        # macOS の既定は「最後に接続したものが勝つ」なので固定優先順位にならない。
+        self.select_input_device(sd)
         # Device-following off: a healthy stream is kept even if the OS default
         # changes. Replacing a working stream would mean another open/start
         # against CoreAudio, which is precisely the call that deadlocks -- so
@@ -222,6 +284,8 @@ class SharedAudioInput:
         # write a spurious WAV.
         self._rec._ensure_stream()
         self._note_stream()
+        self.bound_device = self._vm._identity_label(
+            self._rec._stream_identity).split("@")[0].strip("'\"")
         active = self.stream_active
         logger.info("shared audio: stream open=%s active=%s device=%s rate=%d "
                     "PA_OPEN_COUNT=%d PA_START_COUNT=%d",
@@ -348,6 +412,11 @@ class SharedAudioInput:
         # _silence_threshold は AudioRecorder のインスタンス属性なので、
         # upstream の voice_mode.py を変更せずに外から設定できる。
         self.apply_silence_threshold()
+        try:
+            sd, _np = self._vm._import_audio()
+            self.refresh_preferred_device(sd)
+        except Exception:
+            logger.debug("shared audio: 優先デバイスの再評価に失敗しました")
 
         if self.stream_active:
             return True
@@ -401,6 +470,9 @@ class SharedAudioInput:
             "idle_frames": self.idle_frames,
             "noise_floor": self._floor.floor,
             "silence_threshold": self.silence_threshold,
+            "bound_device": self.bound_device,
+            "preferred_device": self.preferred_device,
+            "device_change_pending": self.device_change_pending,
             "engine_frames_fed": self.engine_frames_fed,
             "feed_errors": self.feed_errors,
             "replacements": self.replacements,

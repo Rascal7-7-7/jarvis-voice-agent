@@ -563,3 +563,47 @@ def test_capture_health_ignores_malformed_capture_lines():
     chk = c.evaluate_capture_health(lines)
     assert chk.status == c.OK
     assert chk.data["peak_rms"] == 12000
+
+
+# ------------------------------------------------------------------ device
+#
+# 案C: 優先順位（外部 > 無線 > 内蔵）で選んだデバイスと、実際に束縛している
+# デバイスが食い違ったら知らせる。切り替えは runtime 再起動が必要なので
+# （follow_default_device=False / CoreAudio デッドロック回避）、
+# 「再起動すれば直る」ことまで出す。
+
+def test_device_check_is_ok_when_bound_matches_preferred():
+    chk = c.evaluate_device({"bound_device": "外部マイク",
+                             "preferred_device": "外部マイク",
+                             "device_change_pending": False})
+    assert chk.status == c.OK
+    assert "外部マイク" in chk.detail
+
+
+def test_device_check_warns_when_a_better_device_appeared():
+    chk = c.evaluate_device({"bound_device": "MacBook Proのマイク",
+                             "preferred_device": "外部マイク",
+                             "device_change_pending": True})
+    assert chk.status == c.WARN
+    assert "再起動" in chk.detail
+
+
+def test_device_check_warns_when_no_device_is_selectable():
+    # クラムシェル中に外部マイクを抜くと候補が消える
+    chk = c.evaluate_device({"bound_device": "外部マイク",
+                             "preferred_device": None,
+                             "device_change_pending": False})
+    assert chk.status == c.WARN
+    assert "候補" in chk.detail
+
+
+def test_device_check_without_counters_is_not_a_failure():
+    chk = c.evaluate_device(None)
+    assert chk.status == c.OK
+    assert chk.data["available"] is False
+
+
+def test_device_check_tolerates_missing_keys():
+    chk = c.evaluate_device({})
+    assert chk.status == c.OK
+    assert chk.data["available"] is False

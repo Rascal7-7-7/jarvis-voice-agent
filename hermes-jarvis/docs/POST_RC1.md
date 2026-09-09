@@ -120,3 +120,76 @@ tests: `tests/test_noise_floor.py` 11 件（ハードウェア不要なので wa
 `SharedAudioInput.ensure_healthy_for_turn` は自分の置換だけを数えており、
 `voice_mode.py` 側の silence watchdog による `controlled replacement N/3` は数えていない。
 案C で置換経路を触る際に整理する。
+
+---
+
+## 変更3: 入力デバイスの優先順位選択（案C）
+
+### 問題
+upstream は「OS の既定入力」をそのまま開く。macOS の既定は
+「最後に接続したものが勝つ」なので、固定優先順位にならない。
+さらに `follow_default_device = False`（CoreAudio デッドロック回避）のため
+稼働中は追従しない ＝ **起動時の選択が実質的に唯一の機会**。
+
+そこにクラムシェル運用が重なる。蓋を閉じている間、内蔵マイクは
+**列挙されるが全サンプル 0 を返す**（ffmpeg で JARVIS 非経由でも -91.0 dB を実測）。
+優先順位に内蔵を残すと、外部マイクを抜いた瞬間に無音デバイスへ落ちる。
+
+### 対策
+`bin/audio_devices.py`（新規）で優先順位選択を行う。
+
+```
+TIER_EXTERNAL = 1   ジャック・USB の実マイク
+TIER_WIRELESS = 2   Bluetooth・Continuity（iPhone をマイクにする）
+TIER_BUILTIN  = 3   内蔵マイク（クラムシェル中は候補から外す）
+TIER_EXCLUDED = 99  仮想ドライバ（NoMachine / BlackHole / Loopback / Soundflower 等）
+```
+
+適用方法: `sd.default.device` を**プロセスローカルに**設定する。
+upstream の `sd.InputStream(...)` は `device=` を渡していないため、これで開く先が決まる。
+**ユーザーのシステム既定入力は変更しない。upstream も無変更。**
+
+### 設計上の判断
+1. **クラムシェルは推測せずシステムから取る。** `ioreg -r -k AppleClamshellState`。
+   ただし**取得失敗（None）を False と混同しない**。不明を「開いている」と扱えば
+   内蔵マイクを外せず、「閉じている」と扱えば蓋が開いた機体で内蔵マイクを失う。
+2. **内蔵と Continuity の判別順序が意味を持つ。**
+   `MacBook Proのマイク` と `Clayのマイク` は同じ語尾なので、機種名の判定を先に置く。
+   実機のデバイス名には U+200E (LRM) が前置されるため制御文字を正規化する。
+3. **稼働中のストリームは差し替えない。** 切り替えは runtime 再起動で行う。
+   watchdog の persistent ERROR 回復は 2026-09-08 21:07 に実機観測済みで、
+   束縛先デバイス消失 → ERROR → 15s grace → kickstart -k → 新 PID →
+   新デバイスへ再束縛、が動くことを確認している。
+4. **未知のデバイス名は TIER_EXTERNAL にする。** USB マイクの可能性が最も高く、
+   仮想ドライバは除外リストで先に落としている。
+
+### 実機結果（2026-09-09 16:52）
+```
+clamshell_closed = True
+候補: tier=1 [5] '外部マイク' / tier=2 [2] 'Clayのマイク'
+除外: tier=3 [7] 'MacBook Proのマイク'（クラムシェル）
+      tier=99 [9][10] NoMachine（仮想）
+
+16:52:12.893  input device = '外部マイク' (tier 1, index 5, clamshell_closed=True)
+16:52:12.944  stream open  PA 1/1
+Device  ✓ 外部マイク
+```
+
+### jarvis-status の Device チェック
+```
+Device ✓ 外部マイク
+Device ! 優先デバイスが '外部マイク' に変わりました（束縛中は 'MacBook Proのマイク'）。
+         切り替えには runtime の再起動が必要です
+Device ! 束縛中 '外部マイク' / 選択可能な候補がありません
+         （クラムシェル中に外部マイクを抜いた等）
+```
+所見#8 の教訓に従い「何が起きていて、どうすれば直るか」まで出す。
+
+`counters()` に `bound_device` / `preferred_device` / `device_change_pending` を追加。
+
+tests: `test_audio_devices.py` 17件（新規）、`test_jarvis_status.py` 69 → 74件。
+
+### 残: 自動切り替えは未実装
+優先デバイスの変化は**検知して通知するだけ**で、自動再起動はしていない。
+利用中に勝手に再起動されるのを避けたため。信頼が積めた段階で
+`device_change_pending` を watchdog の再起動条件に加えるのが次の一手。
