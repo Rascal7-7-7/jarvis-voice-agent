@@ -286,3 +286,48 @@ def test_excluded_list_is_read_from_the_file_by_default():
     assert "client-a" in names
     # コメント行や空行を拾っていないこと
     assert all(n and not n.startswith("#") for n in names)
+
+
+# ---------------------------------------------------------------- 横断検索
+#
+# 「秘書、〜を探して」— 全プロジェクト横断検索（2026-09-09 追加）
+
+
+def test_search_intent_from_several_phrasings():
+    for t in ["秘書、認証を探して", "秘書、loginを検索して",
+              "秘書、ログイン処理はどこ", "秘書、JWTを見つけて"]:
+        intent, payload = js.classify(t, projects=["alpha"], excluded=[])
+        assert intent == js.INTENT_SEARCH, t
+        assert payload["action"] == "read", t
+        assert payload["query"], t
+
+
+def test_search_query_drops_the_trigger_and_verb():
+    _, payload = js.classify("秘書、認証を探して", projects=["alpha"], excluded=[])
+    assert payload["query"] == "認証"
+
+
+def test_project_name_still_wins_over_search():
+    # 既存挙動を壊さない。プロジェクト名があれば従来どおり dispatch。
+    # 「alpha のバグを探して」は横断検索ではなく alpha への指示
+    intent, payload = js.classify("秘書、alpha のバグを探して",
+                                  projects=["alpha"], excluded=[])
+    assert intent == js.INTENT_DISPATCH
+    assert payload["project"] == "alpha"
+
+
+def test_search_on_excluded_project_is_still_refused():
+    intent, _ = js.classify("秘書、client-a で認証を探して",
+                            projects=["client-a"], excluded=["client-a"])
+    assert intent == js.INTENT_REFUSED
+
+
+def test_search_query_of_one_char_is_unknown():
+    # 1文字は全プロジェクトが当たって意味がない
+    intent, _ = js.classify("秘書、aを探して", projects=["alpha"], excluded=[])
+    assert intent == js.INTENT_UNKNOWN
+
+
+def test_brief_words_still_win_over_search():
+    intent, _ = js.classify("秘書、状況を教えて", projects=["alpha"], excluded=[])
+    assert intent == js.INTENT_BRIEF

@@ -43,6 +43,7 @@ EXCLUDE_FILE = os.path.expanduser("~/work/scripts/secretary/excluded.txt")
 INTENT_BRIEF = "BRIEF"
 INTENT_LIST = "LIST"
 INTENT_REPORTS = "REPORTS"
+INTENT_SEARCH = "SEARCH"
 INTENT_DISPATCH = "DISPATCH"
 INTENT_UNKNOWN = "UNKNOWN"
 INTENT_REFUSED = "REFUSED"
@@ -57,6 +58,17 @@ _BRIEF_WORDS = re.compile(
     r"(状況|停滞|止まって|とまって|進捗|どうなって|残ってる|放置)")
 _LIST_WORDS = re.compile(r"(一覧|リスト|全部|どんなプロジェクト)")
 _REPORTS_WORDS = re.compile(r"(レポート|報告書|結果を見)")
+
+# 横断検索。**プロジェクト名が無いときだけ**使う（下の classify を参照）
+_SEARCH_WORDS = re.compile(
+    r"(探して|さがして|探す|検索して|検索|見つけて|みつけて|"
+    r"どこ(に(ある|いる))?)")
+
+# 検索語から落とす助詞・記号。両端だけを削る
+_QUERY_TRIM = " 　、。,.!！?？のをはがも・「」\"'"
+
+# 1文字は全プロジェクトが当たって意味がない
+MIN_QUERY_CHARS = 2
 
 
 # ---- 書き込みを伴う指示の確認 ----
@@ -236,6 +248,15 @@ def classify(utterance: str,
         return INTENT_DISPATCH, {"action": "enqueue", "project": project,
                                  "instruction": instruction or text}
 
+    # 横断検索は**プロジェクト名が無いときだけ**。
+    # 「alpha のバグを探して」は横断検索ではなく alpha への指示なので、
+    # プロジェクト名の判定を先に通す（既存挙動を壊さない）。
+    if _SEARCH_WORDS.search(text):
+        query = _SEARCH_WORDS.sub("", TRIGGER.sub("", text))
+        query = query.strip(_QUERY_TRIM).strip()
+        if len(query) >= MIN_QUERY_CHARS:
+            return INTENT_SEARCH, {"action": "read", "query": query}
+
     return INTENT_UNKNOWN, {"action": "read"}
 
 
@@ -340,6 +361,32 @@ def handle(utterance: str,
         n = len([l for l in out.splitlines() if l.strip().endswith(".md")])
         return (f"レポートは{n}件あります。" if n
                 else "レポートはまだありません。")
+
+    if intent == INTENT_SEARCH:
+        rc, out = _run_cli(["search", "--json", payload["query"]], timeout=60.0)
+        if rc != 0:
+            return "検索に失敗しました。"
+        try:
+            found = json.loads(out)
+        except ValueError:
+            return "検索結果の解析に失敗しました。"
+        said = found.get("speech") or "検索結果を取得できませんでした。"
+        # 保留に置くのは**読み上げ可能な内訳**（プロジェクト名と件数）。
+        # file:line を音声で読むのは無意味なので detail は置かない。
+        # 行単位で見たいときは CLI の `secretary search` を使う。
+        # 秘書経路は C8 を通らないので、保留はここで自分で置く。
+        # 内訳が意味を持つのは**2プロジェクト以上**に当たったとき。
+        # has_more_detail（200字差）は C8 の要約向けの基準で、
+        # 7プロジェクトの内訳でも 120 字程度なので常に偽になる。
+        spoken = found.get("spoken_detail") or ""
+        try:
+            import jarvis_followup as _fu
+            if (int(found.get("project_count") or 0) >= 2
+                    and _fu.remember(spoken, "SECRETARY")):
+                said += "内訳も読み上げますか。"
+        except Exception:  # 続き読みが使えなくても検索結果は返す
+            pass
+        return said
 
     if intent == INTENT_DISPATCH:
         # 書き込みを伴うので即実行しない。復唱して確認を取る。
