@@ -296,12 +296,27 @@ class SharedAudioInput:
         return active
 
     def _note_stream(self) -> None:
-        """Count stream constructions by watching the object change."""
+        """Count stream constructions by watching the object change.
+
+        置換の計数もここで行う（2026-09-09 の修正）。置換経路は3つあり、
+        以前は 2 だけが自分で ``replacements`` を加算していたため、
+        ログに ``controlled replacement 1/3`` が出ていてもカウンタは 0 のままだった。
+
+          1. ``open_once``                    初回オープン
+          2. ``ensure_healthy_for_turn``      死んだストリームの復旧
+          3. ``jarvis_runtime`` の無音 watchdog  ``open_once`` を呼び直す
+
+        オブジェクトの入れ替わりを見ているのはこのメソッドだけなので、
+        どの経路から来ても必ず通る。ここに集約すれば数え漏れが起きない。
+        """
         st = getattr(self._rec, "_stream", None)
         if st is not None and st is not self._stream_obj:
+            first_open = self._stream_obj is None
             self._stream_obj = st
             self.pa_open_count += 1
             self.pa_start_count += 1
+            if not first_open:
+                self.replacements += 1
 
     @property
     def stream_active(self) -> bool:
@@ -423,7 +438,7 @@ class SharedAudioInput:
 
         logger.warning("shared audio: stream is not active before TURN=%d — "
                        "attempting one controlled replacement", turn)
-        self.replacements += 1
+        # replacements は _note_stream() が数える（経路によらず一箇所に集約）
         try:
             self._rec._close_stream_with_timeout()
         except Exception:

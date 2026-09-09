@@ -193,3 +193,76 @@ tests: `test_audio_devices.py` 17件（新規）、`test_jarvis_status.py` 69 �
 優先デバイスの変化は**検知して通知するだけ**で、自動再起動はしていない。
 利用中に勝手に再起動されるのを避けたため。信頼が積めた段階で
 `device_change_pending` を watchdog の再起動条件に加えるのが次の一手。
+
+---
+
+## 変更4: 置換の数え漏れを修正（所見#2）
+
+置換経路は**3つ**あり、以前は 2 だけが自分で `replacements` を加算していた。
+ログに `controlled replacement 1/3` が出ていてもカウンタが 0 のままだったのはこれが理由。
+
+| 経路 | 場所 | 修正前 |
+|---|---|---|
+| 初回オープン | `shared_audio.open_once` | 対象外 |
+| 死んだストリームの復旧 | `shared_audio.ensure_healthy_for_turn` | 加算していた |
+| **無音 watchdog** | **`jarvis_runtime.py:1230`** | **加算していなかった** |
+
+第3経路は `detector.audio_silent` を契機に走り、`shared.open_once()` を呼び直す。
+`open_once` は `_note_stream()` を通るので `pa_open_count` は増えるが、
+`replacements` は `ensure_healthy_for_turn` 側にしか無かった。
+
+**対策**: 数える場所を `_note_stream()` に集約した。ストリームオブジェクトの
+入れ替わりを見ているのはこのメソッドだけなので、どの経路から来ても必ず通る。
+`ensure_healthy_for_turn` の明示加算は二重計上になるため撤去した。
+
+**副産物**: 無音起因の置換は `open_once()` を呼ぶため、案C のデバイス優先順位
+再選択も自動で走るようになった。無音デバイスに張り付いたまま置換を繰り返す事故が減る。
+
+tests: `test_replacement_counter.py` 5件（新規）。
+
+---
+
+## 変更5: 音声から秘書を呼ぶ経路（SECRETARY 宛先）
+
+### 到達経路は決定的なキーワードだけ
+`DELEGATION_SECURITY.md` の中心原則は「**LLM Router ≠ security boundary**」。
+router は gemma4:e2b で `dangerous_action_accuracy 0.75` と実測されている
+（「gitで強制プッシュして」を CODEX と分類した）。したがって:
+
+- **`SECRETARY` を `jarvis_router.LABELS` に入れない。**
+  LABELS は LLM 出力の検証に使われるので、入れなければモデルはこの宛先を発明できない
+- 到達は `_OVERRIDES` の決定的パターン `(秘書|ひしょ)` のみ
+- `jarvis_gate.check()` は override より前に走る（`route()` の順序）
+
+実測での確認:
+```
+秘書、状況を教えて            → SECRETARY  explicit_override  llm_used=False
+秘書、このファイル全部消して   → CONFIRMATION_REQUIRED  security_gate  ← gate が勝つ
+LABELS に SECRETARY           → False
+```
+この契約は `test_jarvis_secretary.py` でテストとして固定した。
+
+### 音声からは書き込まない（v1 の境界）
+JARVIS の委譲は `--permission-mode plan` / `--sandbox read-only` が argv に
+ピン留めされ、「Write delegation. Not enabled.」と明記されている。
+一方 `secretary dispatch --headless` は書き込む。直結すると
+**JARVIS が実質的な書き込み経路を獲得**するので、v1 では:
+
+- 読み取り系（状況・一覧・レポート）は即実行する
+- dispatch は**キュー登録のみ**。実行はテキスト側の明示操作に委ねる
+
+音声は「指示を取りこぼさず捕まえる」ところまでを担い、実行の引き金は人が引く。
+
+### 実装中に踏んだバグ
+1. `jarvis-dispatch` の変数名は `$PY`。`$VENV_PY` は存在しない（`zsh -n` で検出）
+2. `subprocess` の strict デコードで `UnicodeDecodeError`。呼び先はシェルスクリプトで
+   不正バイトが混ざり得るため `errors="replace"` にした。読み上げ文を作るために
+   呼んでいるのだから、1 バイトの欠けで全体を落としてはいけない
+3. **LC_ALL の強制が新しい障害を作った。** `survey.sh` が
+   `note?: unbound variable` で落ちた。`${note:+$note・}` の**パラメータ展開の中に
+   多バイト文字**があり、ロケール次第で変数名ごと壊れる。ASCII 区切りに置き換え、
+   4 種のロケール（en_US.UTF-8 / C / ja_JP.UTF-8 / 未設定）で検証した
+4. 読み上げ品質: `survey.sh` はコミット 0 件のリポジトリに `idle_days=999` を入れる。
+   これは番兵値なので「999日放置」と読み上げるのは事実と違う。日数のあるものと分けた
+
+tests: `test_jarvis_secretary.py` 19件（新規）。

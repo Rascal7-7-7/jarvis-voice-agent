@@ -124,6 +124,12 @@ def split_local(text: str, proposed: str) -> tuple[str, str]:
 # ---- step 2: explicit overrides. Deterministic, so the user always wins over
 # the model — but never over step 1.
 _OVERRIDES = (
+    # SECRETARY は決定的な override だけで到達する宛先。**LABELS には入れない**。
+    # LABELS は LLM 出力の検証に使われるので、入れなければモデルはこの宛先を
+    # 発明できない。router は dangerous_action_accuracy 0.75 と実測されており、
+    # 書き込みに繋がり得る経路をモデル判断に委ねない（DELEGATION_SECURITY.md）。
+    # gate はこのループより前に走るので、危険発話はここに到達しない。
+    ("SECRETARY", re.compile(r"(秘書|ひしょ)")),
     ("CODEX", re.compile(r"(コーデックス|codex)", re.IGNORECASE)),
     ("CLAUDE", re.compile(r"(クロード|claude)", re.IGNORECASE)),
     ("WEB", re.compile(r"(ウェブで|webで|ネットで|検索して|ググって|クロームで|chromeで)", re.IGNORECASE)),

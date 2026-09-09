@@ -57,6 +57,20 @@ case "$route" in
     print "その操作は取り消せない可能性があります（${cats}）。実行してよろしいですか？"
     exit 0
     ;;
+  SECRETARY)
+    # 決定的な override だけで到達する宛先（LABELS に無いので LLM は選べない）。
+    # 読み取り系は即実行し、書き込みを伴う指示はキュー登録までで止める。
+    # 実行の引き金はテキスト側で人が引く（DELEGATION_SECURITY.md の
+    # 「Write delegation. Not enabled.」を音声経路でも崩さないため）。
+    out=$("$PY" -c '
+import sys, os
+sys.path.insert(0, os.path.expanduser("~/AI-Lab/hermes-jarvis/bin"))
+import jarvis_secretary as s
+print(s.handle(sys.argv[1]))
+' "$UTTERANCE" 2>/dev/null) || {
+      print "秘書を利用できませんでした。"; exit 0
+    }
+    ;;
   CODEX)
     out=$("$BIN/jarvis-codex" "$WORKDIR" "$UTTERANCE 日本語で簡潔に。" 2>/dev/null) || {
       print "Codexを利用できませんでした。"; exit 0
