@@ -211,7 +211,7 @@ _turn = {"id": None, "route": None, "timeline": None}
 # SECRETARY and OPEN are reachable by deterministic override only; they are
 # absent from jarvis_router.LABELS so the LLM cannot emit them.
 ROUTES = ("LOCAL_FAST", "LOCAL_TOOL", "LOCAL", "WEB", "CODEX", "CLAUDE",
-          "SECRETARY", "OPEN")
+          "SECRETARY", "OPEN", "FOLLOWUP")
 
 # name -> (start mark, end mark). Every one is already measured by Timeline;
 # nothing new is instrumented.

@@ -113,10 +113,18 @@ def plan_dispatch(project: str, instruction: str) -> tuple[str, dict]:
 
 
 def save_pending(pending: dict, path: str = PENDING_PATH) -> None:
+    """確認待ちを 0600 で置く。
+
+    指示文がそのまま入るので、他ユーザーから読めてはいけない。
+    2026-09-09 まで既定の umask 任せ（0644）で、さらに git にも
+    追跡されていた（空のまま commit されていたので漏れてはいない）。
+    """
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(pending, fh, ensure_ascii=False)
+        os.chmod(path, 0o600)  # 既存ファイルを開いた場合に備える
     except OSError:
         pass
 

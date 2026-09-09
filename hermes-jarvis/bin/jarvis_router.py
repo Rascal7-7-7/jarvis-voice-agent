@@ -28,7 +28,9 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import jarvis_gate
-import jarvis_open  # noqa: E402
+import jarvis_followup
+import jarvis_open
+import jarvis_secretary  # noqa: E402
 
 OLLAMA = os.environ.get("JARVIS_OLLAMA", "http://127.0.0.1:11434/v1/chat/completions")
 MODEL = os.environ.get("JARVIS_ROUTER_MODEL", "gemma4:e2b")
@@ -221,6 +223,32 @@ def route(utterance: str) -> dict:
                 "categories": gated["categories"], "matched": gated["matched"],
                 "llm_used": False, "latency": round(time.perf_counter() - t0, 3),
                 "utterance": text}
+
+    # 確認待ちがあるなら、返事はその持ち主へ渡す。**gate の後・LLM の前**。
+    #
+    # なぜここか: bare「はい」は LLM 経路で LOCAL_FAST に落ちていた。
+    # そのため C8 の「詳細も読み上げますか？」にも、秘書の書き込み確認にも
+    # 答えられなかった（「秘書、はい」と名前を呼ぶ必要があった）。
+    #
+    # 誤発火しない理由: answer_only は**発話全体が返事だけ**のときしか
+    # 種類を返さない。確認待ちは 180 秒有効なので、その間の普通の発話が
+    # 「お願い」を含むだけで書き込みを承諾してはいけない。
+    #
+    # 秘書の確認が followup より先。書き込みの同意を先に処理する。
+    # FOLLOWUP / SECRETARY はどちらも LABELS に無いので LLM は選べない。
+    answer = jarvis_followup.answer_only(text)
+    if answer is not None:
+        if (answer in (jarvis_followup.ANSWER_YES, jarvis_followup.ANSWER_NO)
+                and jarvis_secretary.load_pending() is not None):
+            return {"route": "SECRETARY", "decided_by": "pending_answer",
+                    "categories": [], "llm_used": False,
+                    "latency": round(time.perf_counter() - t0, 3),
+                    "utterance": text}
+        if jarvis_followup.pending() is not None:
+            return {"route": "FOLLOWUP", "decided_by": "pending_answer",
+                    "categories": [], "llm_used": False,
+                    "latency": round(time.perf_counter() - t0, 3),
+                    "utterance": text}
 
     # 0 ms LOCAL_FAST: greetings and thanks. Still passed through split_local,
     # so even this cannot outrank the current-fact demotion.

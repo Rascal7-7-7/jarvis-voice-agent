@@ -84,6 +84,25 @@ print(sp.sanitize(sys.stdin.read()))
 '
     exit 0
     ;;
+  FOLLOWUP)
+    # 「詳細も読み上げますか。」への返事。決定的な判定のみで到達する
+    # （LABELS に無いので LLM は選べない）。保留が無ければ何も起きない。
+    out=$("$PY" -c '
+import sys, os
+sys.path.insert(0, os.path.expanduser("~/AI-Lab/hermes-jarvis/bin"))
+import jarvis_followup as f
+print(f.handle(sys.argv[1]) or "続きはありません。")
+' "$UTTERANCE" 2>/dev/null) || {
+      print "続きを読み上げられませんでした。"; exit 0
+    }
+    print -r -- "$out" | "$PY" -c '
+import sys, os
+sys.path.insert(0, os.path.expanduser("~/AI-Lab/hermes-jarvis/bin"))
+import jarvis_speech as sp
+print(sp.sanitize(sys.stdin.read()))
+'
+    exit 0
+    ;;
   OPEN)
     # SECRETARY と同じく決定的 override のみで到達する（LABELS に無い）。
     # 何を開くかは jarvis_open.TARGETS の許可リストが決め、
@@ -196,7 +215,7 @@ esac
 
 # ---- C8: shrink a delegated answer to something speakable -------------------
 "$PY" - "$route" <<PYEOF
-import json, os, sys, urllib.request
+import json, os, re, sys, urllib.request
 route = sys.argv[1]
 detail = """$out"""
 body = {
@@ -204,8 +223,7 @@ body = {
     "messages": [
         {"role": "system", "content":
          "あなたはJarvis。渡された調査結果を、音声で読み上げる用に日本語2文以内へ要約します。"
-         "結論を先に言い、箇条書き・記号・コードは使いません。"
-         "最後に「詳細も読み上げますか？」と付け加えます。"},
+         "結論を先に言い、箇条書き・記号・コードは使いません。"},
         {"role": "user", "content": detail[:4000]},
     ],
     "max_tokens": 220, "temperature": 0, "reasoning_effort": "none",
@@ -220,6 +238,18 @@ except Exception:
     said = ""
 sys.path.insert(0, os.path.expanduser("~/AI-Lab/hermes-jarvis/bin"))
 import jarvis_speech as sp
-print(sp.sanitize(said or (detail.strip().splitlines() or ["結果を取得しました。"])[0]))
+import jarvis_followup as fu
+
+said = sp.sanitize(said or (detail.strip().splitlines() or ["結果を取得しました。"])[0])
+
+# 「詳細も読み上げますか。」は**決定的に**付ける。
+# 2026-09-09 まではモデルに付けさせていたため、詳細が無いときにも聞いており、
+# しかも答える経路が存在しなかった（果たせない約束）。
+# 続きが本当にあるときだけ聞き、そのときだけ本文を保留に置く。
+said = re.sub(r"詳細も読み上げますか[。？?]?\s*$", "", said).strip()
+if fu.has_more_detail(said, detail) and fu.remember(detail, route):
+    said = said + "詳細も読み上げますか。"
+
+print(said)
 print(f"\n--- {route} full output ({len(detail)} chars) kept for the HUD ---", file=sys.stderr)
 PYEOF
