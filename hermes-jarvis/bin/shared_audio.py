@@ -39,6 +39,9 @@ cap, frame accounting) is untouched upstream code, driven exactly as before.
 """
 from __future__ import annotations
 
+from collections import deque
+from statistics import median
+
 import logging
 import threading
 
@@ -51,6 +54,69 @@ logger = logging.getLogger("jarvis")
 _ENGINE_RATE = 16000
 # openWakeWord scores one frame of this many 16 kHz samples (~80 ms) at a time.
 _ENGINE_FRAME = 1280
+
+
+# --------------------------------------------------------- noise floor
+#
+# なぜ必要か（2026-09-09 実測）:
+#   upstream の SILENCE_RMS_THRESHOLD は 200 固定。しかし外部マイク（ジャック）の
+#   無発話時ノイズフロアは mean RMS ≈ 2,663 で、しきい値の 13 倍あった。
+#   silence callback は「rms <= threshold が 3 秒連続」で発火するため、
+#   この構成では原理的に一度も発火せず、capture が毎回 30 秒上限まで走っていた
+#   （1 ターン +26 秒）。内蔵マイクは PEAK_RMS 1,446〜1,764 で発火していたので、
+#   固定しきい値は「静かなデバイス」を暗黙の前提にしていたことになる。
+#
+# 測り方:
+#   共有ストリームはターン間も idle フレームを見ている（_on_idle_frame）。
+#   そこで各チャンクの RMS を観測しておけば、ノイズフロアは追加コストなしで得られる。
+#   平均ではなく**中央値**を使う: idle 中に wake word 発話が混ざってもフロアが
+#   引き上げられないため。
+#
+# しきい値の決め方:
+#   threshold = clamp(floor * MULTIPLIER, MINIMUM, MAXIMUM)
+#   - MINIMUM は upstream の 200。静かなデバイスでは挙動を変えない
+#   - MAXIMUM は上げ過ぎて発話ごと無音扱いになるのを防ぐ安全弁
+_FLOOR_WINDOW = 100
+_FLOOR_MULTIPLIER = 2.5
+_FLOOR_MIN_THRESHOLD = 200      # upstream SILENCE_RMS_THRESHOLD と一致させる
+_FLOOR_MAX_THRESHOLD = 8000
+
+
+class NoiseFloorTracker:
+    """idle フレームの RMS からノイズフロアを推定し、無音しきい値を出す。
+
+    audio callback スレッドから ``observe`` が呼ばれるので、1 回あたりの仕事は
+    deque への append だけに留める。中央値の計算は ``floor`` 参照時（ターン前、
+    1 ターン 1 回）にだけ行う。
+    """
+
+    def __init__(self, window: int = _FLOOR_WINDOW) -> None:
+        self._samples: deque[int] = deque(maxlen=max(1, int(window)))
+
+    def observe(self, rms) -> None:
+        """1 チャンク分の RMS を記録する。異常値は黙って捨てる。"""
+        try:
+            value = int(rms)
+        except (TypeError, ValueError):
+            return
+        if value < 0:
+            return
+        self._samples.append(value)
+
+    @property
+    def floor(self) -> int | None:
+        if not self._samples:
+            return None
+        return int(median(self._samples))
+
+    def threshold(self,
+                  minimum: int = _FLOOR_MIN_THRESHOLD,
+                  multiplier: float = _FLOOR_MULTIPLIER,
+                  maximum: int = _FLOOR_MAX_THRESHOLD) -> int:
+        floor = self.floor
+        if floor is None:
+            return minimum
+        return max(minimum, min(maximum, int(floor * multiplier)))
 
 
 class SharedAudioInput:
@@ -98,6 +164,11 @@ class SharedAudioInput:
         self.pa_start_count = 0          # each construction is start()ed once
         self.idle_frames = 0
         self.idle_chunks = 0
+        # ノイズフロア追跡。idle フレームから測るので追加の録音は不要。
+        self._floor = NoiseFloorTracker()
+        self._floor_stride = 4      # 4 チャンクに 1 回だけ測る（callback を軽く保つ）
+        self._floor_tick = 0
+        self.silence_threshold = _FLOOR_MIN_THRESHOLD
         self.engine_frames_fed = 0
         self.feed_errors = 0
         self.replacements = 0
@@ -208,6 +279,13 @@ class SharedAudioInput:
             self.idle_chunks += 1
             self.idle_frames += n
 
+            # ノイズフロアの観測。callback を軽く保つため間引く。
+            # ここは「発話していない区間」なので、得られる RMS はほぼ環境ノイズ。
+            self._floor_tick += 1
+            if self._floor_tick % self._floor_stride == 0:
+                self._floor.observe(
+                    np.sqrt(np.mean(frame.astype(np.float32) ** 2)))
+
             rate = int(self._rec._sample_rate or _ENGINE_RATE)
             # Buffer the RAW capture-rate audio and resample a whole capture
             # frame at a time -- 3840 -> 1280 at 48 kHz, an exact 3:1. This is
@@ -263,6 +341,14 @@ class SharedAudioInput:
         LISTENING, and abandoning a thread blocked inside a CoreAudio guard
         mutex would leak it and make the next open worse.
         """
+        # 適応的な無音しきい値をターンごとに適用する。
+        # upstream の固定値 200 は静かなデバイスを前提にしており、ノイズフロアが
+        # それを上回るデバイス（実測: 外部マイクで RMS 2,663）では silence callback が
+        # 一度も発火せず capture が 30 秒上限まで走る。
+        # _silence_threshold は AudioRecorder のインスタンス属性なので、
+        # upstream の voice_mode.py を変更せずに外から設定できる。
+        self.apply_silence_threshold()
+
         if self.stream_active:
             return True
 
@@ -286,6 +372,26 @@ class SharedAudioInput:
                        "succeeded" if ok else "FAILED", self.pa_open_count)
         return ok
 
+    def apply_silence_threshold(self) -> int:
+        """測ったノイズフロアから無音しきい値を決め、recorder へ設定する。
+
+        戻り値は実際に設定した値。recorder が属性を持たない場合（テストの
+        フェイク等）は設定を諦め、値だけ返す。
+        """
+        threshold = self._floor.threshold()
+        self.silence_threshold = threshold
+        floor = self._floor.floor
+        try:
+            previous = getattr(self._rec, "_silence_threshold", None)
+            self._rec._silence_threshold = threshold
+        except Exception:
+            logger.debug("shared audio: could not set _silence_threshold")
+            return threshold
+        if previous != threshold:
+            logger.info("shared audio: silence threshold %s -> %d "
+                        "(noise floor %s)", previous, threshold, floor)
+        return threshold
+
     def counters(self) -> dict:
         return {
             "PA_OPEN_COUNT": self.pa_open_count,
@@ -293,6 +399,8 @@ class SharedAudioInput:
             "stream_active": self.stream_active,
             "idle_chunks": self.idle_chunks,
             "idle_frames": self.idle_frames,
+            "noise_floor": self._floor.floor,
+            "silence_threshold": self.silence_threshold,
             "engine_frames_fed": self.engine_frames_fed,
             "feed_errors": self.feed_errors,
             "replacements": self.replacements,
