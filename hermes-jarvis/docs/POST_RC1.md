@@ -627,3 +627,84 @@ warm とターンが同じ runner を共有しても、片方が壊れること�
 - ollama を bootout したまま runtime を起動したため
   `Startup warm ! abandoned after 41.1s / 11 attempts` を意図的に発生させた
   → ollama を bootstrap して復旧（2 秒で復帰）、その後 HEALTHY を確認
+
+---
+
+## 変更12: 音声からの書き込み実行（確認つき）
+
+### 設計判断: 確認を 1 回挟む
+`DELEGATION_SECURITY.md` は gate の限界を明記している:
+
+> **The gate is a keyword matcher.** A deliberately obfuscated utterance
+> （「あの子を綺麗にしといて」）is not covered. It raises the cost of an
+> accident, not of a determined adversary with microphone access.
+
+gate は**事故のコストを上げる**ものであって、書き込みの最終判断を委ねられる
+仕組みではない。したがって書き込みを伴う指示は**復唱して確認を 1 回取る**。
+読み取り（状況・一覧・レポート）は即実行のまま。
+
+判定はすべて決定的なパターン（`CONFIRM_YES` / `CONFIRM_NO`）。モデルには委ねない。
+
+### 実装
+- 確認待ちの状態は `~/work/scripts/secretary/pending.json` に持つ。
+  発話ごとにプロセスが立ち上がるので、メモリ上の状態は次の発話まで残らない
+- TTL 180 秒。放置した確認が後の「はい」で誤発火するのを防ぐ
+- **否定を先に見る。**「はい、やめて」のような混在は**安全側（拒否）に倒す**
+- 確認中に読み取り指示を挟んでも pending は消さない
+  （「秘書、状況を教えて」で確認が消えるのは不便）
+
+### 実機検証
+```
+① 秘書、tradingview-mcp の未コミットを整理して
+   → 「tradingview-mcp に「未コミットを整理して」を実行します。よろしいですか。」
+     pending 保存 = True
+② 秘書、状況を教えて（確認中に割り込む）
+   → 停滞7件を回答、pending 保持 = True
+③ やめて
+   → 「取り消しました。」pending 消去 = True
+④ is_confirmation: 'はい、やめて'→False / 'はい'→True / 'いいえ'→False / '今日の天気'→None
+```
+
+tests: `test_jarvis_secretary.py` 19 → 26件。
+
+---
+
+## 変更13: 秘書から Codex へ指示を出す
+
+### 境界がここだけ違う
+JARVIS の音声経路（`bin/jarvis-codex`）は argv に `--sandbox read-only` を
+**ピン留めしており書き込み経路が存在しない**。このピン留めには触らない。
+
+秘書は**テキスト経路**で、人が明示的に叩くものなので `--sandbox workspace-write`
+を使う。同じ Codex でも呼ばれ方によって境界が違うという設計を明示した。
+
+### 実装上の必須事項（DELEGATION_SECURITY.md の実測に基づく）
+- **ハードタイムアウト（既定 600s）。** `codex exec` は `openai_base_url` が
+  死んでいると永久に retry する（実測 10 分超、`Reconnecting...` を出し続ける）。
+  プロセスグループごと `SIGKILL` する
+- **ディレクトリ許可リスト。** `~/work` 配下のみ（それ以外は exit 77）
+- `codex exec` は `approval_policy` を無視し `approval: never` で動く。
+  書き込みを止めているのは sandbox 指定だけなので明示的に渡す
+
+### 実装中に踏んだバグ
+`env: node: No such file or directory` (exit 127)。`codex` は
+`#!/usr/bin/env node` の node スクリプトで、サブシェルの PATH に node が無いと即死する。
+→ `codex_bin` と同じディレクトリに `node` が居るので、`os.path.dirname(codex_bin)` を
+PATH の先頭に置いた（パスを二重にハードコードしない）。
+
+### 実機検証（2026-09-09 19:26）
+```
+secretary dispatch --codex tradingview-mcp '未コミット差分を確認し2行で要約。変更・コミットはしない'
+→ 14 秒で完了 exit=0
+→ approval: never / sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+→ git diff で確認し「bin 定義が追加されている。依存関係の変更なし」と回答
+→ リポジトリは無変更（M package-lock.json のまま）
+```
+同じ調査を Claude（15:27）も行っており**結論が一致した**。
+独立した 2 エンジンでクロスチェックできる。
+
+### 使い方
+```
+secretary dispatch --headless <project> "<指示>"   claude --print
+secretary dispatch --codex    <project> "<指示>"   codex exec
+```

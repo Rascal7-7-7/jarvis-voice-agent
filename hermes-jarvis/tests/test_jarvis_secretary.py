@@ -172,3 +172,56 @@ def test_brief_reply_when_every_stalled_project_has_no_commit():
         {"name": "a", "stalled": 1, "idle_days": 999, "dirty": 1}]})
     assert "999" not in reply
     assert "1件" in reply
+
+
+# ------------------------------------------- 音声からの書き込み実行（確認つき）
+#
+# 設計判断（DELEGATION_SECURITY.md に基づく）:
+#   gate は keyword matcher であり、意図的に難読化した発話は覆えないと明記されている
+#   （「あの子を綺麗にしといて」）。gate は「事故のコストを上げる」ものであって、
+#   書き込みの最終判断を委ねられる仕組みではない。
+#   よって書き込みを伴う指示は**復唱して確認を1回取る**。読み取りは即実行のまま。
+#
+#   確認は決定的なパターンで判定する（モデルに委ねない）。
+#   確認待ちの状態はファイルに持つ（プロセスをまたぐため）。
+
+def test_a_write_instruction_asks_for_confirmation():
+    reply, pending = js.plan_dispatch("it-study", "未コミットを整理して")
+    assert pending is not None
+    assert pending["project"] == "it-study"
+    assert "it-study" in reply
+    assert "よろしいですか" in reply or "実行しますか" in reply
+
+
+def test_the_confirmation_repeats_the_instruction_back():
+    """復唱がないと、聞き間違いをそのまま実行してしまう。"""
+    reply, _ = js.plan_dispatch("automation", "テストを直して")
+    assert "テストを直して" in reply
+
+
+def test_yes_confirms():
+    for u in ("はい", "はい、お願い", "実行して", "OK", "オーケー", "やって"):
+        assert js.is_confirmation(u) is True, u
+
+
+def test_no_cancels():
+    for u in ("いいえ", "やめて", "キャンセル", "違う", "だめ"):
+        assert js.is_confirmation(u) is False, u
+
+
+def test_an_unrelated_utterance_is_neither():
+    for u in ("今日の天気", "秘書、状況を教えて", ""):
+        assert js.is_confirmation(u) is None, u
+
+
+def test_confirmation_uses_deterministic_patterns_only():
+    """モデルに判定させない。パターンは決定的であること。"""
+    import re
+    assert isinstance(js.CONFIRM_YES, re.Pattern)
+    assert isinstance(js.CONFIRM_NO, re.Pattern)
+
+
+def test_read_instructions_do_not_ask_for_confirmation():
+    for u in ("秘書、状況を教えて", "秘書、レポートを見せて"):
+        _intent, payload = js.classify(u, projects=["it-study"])
+        assert payload["action"] == "read"

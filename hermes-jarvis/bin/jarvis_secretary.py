@@ -33,6 +33,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from typing import Any, Iterable, Mapping
 
 SECRETARY_CLI = os.path.expanduser("~/work/scripts/secretary/secretary")
@@ -54,6 +55,91 @@ _BRIEF_WORDS = re.compile(
     r"(状況|停滞|止まって|とまって|進捗|どうなって|残ってる|放置)")
 _LIST_WORDS = re.compile(r"(一覧|リスト|全部|どんなプロジェクト)")
 _REPORTS_WORDS = re.compile(r"(レポート|報告書|結果を見)")
+
+
+# ---- 書き込みを伴う指示の確認 ----
+#
+# なぜ確認を挟むか（DELEGATION_SECURITY.md）:
+#   gate は keyword matcher であり、**意図的に難読化した発話は覆えないと明記**
+#   されている（「あの子を綺麗にしといて」）。gate は「事故のコストを上げる」
+#   ものであって、書き込みの最終判断を委ねられる仕組みではない。
+#   よって書き込みを伴う指示は復唱して確認を 1 回取る。読み取りは即実行のまま。
+#
+# 判定はすべて決定的なパターン。モデルには一切委ねない。
+CONFIRM_YES = re.compile(
+    r"(はい|ハイ|うん|そう|お願い|おねがい|実行|やって|やろう|進めて|"
+    r"\bok\b|オーケー|おーけー|いいよ|頼む|たのむ)", re.IGNORECASE)
+CONFIRM_NO = re.compile(
+    r"(いいえ|いえ|いや|やめ|止め|とめ|キャンセル|きゃんせる|"
+    r"違う|ちがう|だめ|ダメ|不要|なし|\bno\b)", re.IGNORECASE)
+
+# 確認待ちの状態はファイルに持つ。発話ごとにプロセスが立ち上がるため、
+# メモリ上の状態は次の発話まで残らない。
+PENDING_PATH = os.path.expanduser("~/work/scripts/secretary/pending.json")
+
+# 確認待ちの有効期限。放置した確認が後の「はい」で誤発火するのを防ぐ。
+PENDING_TTL_SECONDS = 180
+
+
+def is_confirmation(utterance: str | None) -> bool | None:
+    """確認の返事か。``True``=承諾 / ``False``=拒否 / ``None``=どちらでもない。
+
+    否定を先に見る。「はい、やめて」のような混在では**安全側**（拒否）に倒す。
+    """
+    if not utterance:
+        return None
+    text = utterance.strip()
+    if not text:
+        return None
+    if CONFIRM_NO.search(text):
+        return False
+    if CONFIRM_YES.search(text):
+        return True
+    return None
+
+
+def plan_dispatch(project: str, instruction: str) -> tuple[str, dict]:
+    """書き込みを伴う指示を復唱し、確認待ちの内容を返す。
+
+    復唱がないと、聞き間違いをそのまま実行してしまう。
+    戻り値は (読み上げる文, 確認待ちの内容)。
+    """
+    pending = {"project": project, "instruction": instruction,
+               "created": time.time()}
+    reply = (f"{project} に「{instruction}」を実行します。よろしいですか。")
+    return reply, pending
+
+
+def save_pending(pending: dict, path: str = PENDING_PATH) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(pending, fh, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def load_pending(path: str = PENDING_PATH,
+                 ttl: float = PENDING_TTL_SECONDS) -> dict | None:
+    """確認待ちを読む。期限切れは無効として扱い、ファイルも消す。"""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or "project" not in data:
+        return None
+    if time.time() - float(data.get("created") or 0) > ttl:
+        clear_pending(path)
+        return None
+    return data
+
+
+def clear_pending(path: str = PENDING_PATH) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def matches(utterance: str | None) -> bool:
@@ -168,6 +254,26 @@ def handle(utterance: str,
 
     書き込みは行わない。dispatch はキュー登録までで止める。
     """
+    # 確認待ちがあるなら、まずそれへの返事として解釈する。
+    # 「はい」だけの発話に意味を持たせられるのはここだけ。
+    waiting = load_pending()
+    if waiting is not None:
+        answer = is_confirmation(utterance)
+        if answer is True:
+            clear_pending()
+            rc, _out = _run_cli(["dispatch", "--headless",
+                                 waiting["project"], waiting["instruction"]],
+                                timeout=20.0)
+            if rc != 0:
+                return f"{waiting['project']} の実行を開始できませんでした。"
+            return (f"{waiting['project']} で実行を開始しました。"
+                    "結果はレポートに出ます。")
+        if answer is False:
+            clear_pending()
+            return "取り消しました。"
+        # どちらでもない発話は確認を保持したまま、通常処理へ進む。
+        # 「秘書、状況を教えて」で確認が消えるのは不便なので消さない。
+
     intent, payload = classify(utterance, projects=projects)
 
     if intent == INTENT_BRIEF:
@@ -195,13 +301,13 @@ def handle(utterance: str,
                 else "レポートはまだありません。")
 
     if intent == INTENT_DISPATCH:
-        # キュー登録のみ。--headless は音声からは呼ばない。
-        rc, _out = _run_cli(["dispatch", payload["project"],
-                             payload["instruction"]])
-        if rc != 0:
-            return f"{payload['project']} への登録に失敗しました。"
-        return (f"{payload['project']} への指示をキューに入れました。"
-                "実行は画面から確認してください。")
+        # 書き込みを伴うので即実行しない。復唱して確認を取る。
+        # gate は keyword matcher であり難読化した発話を覆えないと
+        # DELEGATION_SECURITY.md が明記しているため、最終判断は人が下す。
+        reply, pending = plan_dispatch(payload["project"],
+                                       payload["instruction"])
+        save_pending(pending)
+        return reply
 
     return ("秘書にできるのは、状況の確認、プロジェクト一覧、"
             "レポートの確認、それにプロジェクト名を指定した指示の登録です。")
