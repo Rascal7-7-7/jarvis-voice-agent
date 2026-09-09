@@ -58,6 +58,19 @@ _ENGINE_RATE = 16000
 _ENGINE_FRAME = 1280
 
 
+def _set_input_device(sd, index: int) -> None:
+    """``sd.default.device`` の**入力スロットだけ**を設定する。
+
+    初版は ``sd.default.device = (index, 既存の出力index)`` としていたが、
+    デバイスの抜き差しで PortAudio の index は振り直されるため、
+    「保存した出力 index」が別デバイスを指し得る。出力は触らないのが正しい。
+
+    macOS では出力に sounddevice を使わない（TCC 回避。voice_mode の
+    ``_sounddevice_output_allowed`` 参照）ので現状は無害だが、潜在バグなので直す。
+    """
+    sd.default.device[0] = int(index)
+
+
 # --------------------------------------------------------- noise floor
 #
 # なぜ必要か（2026-09-09 実測）:
@@ -226,9 +239,10 @@ class SharedAudioInput:
             return None
         self.preferred_device = chosen["name"]
         try:
-            current = sd.default.device
-            output = current[1] if isinstance(current, (list, tuple)) else None
-            sd.default.device = (chosen["index"], output)
+            # 入力スロットだけを触る。出力は macOS では afplay がシステム既定を
+            # 使うので JARVIS の管轄外であり、index を保存すると抜き差しで
+            # 別デバイスを指す危険がある。
+            _set_input_device(sd, chosen["index"])
         except Exception:
             logger.exception("shared audio: sd.default.device の設定に失敗しました")
             return chosen

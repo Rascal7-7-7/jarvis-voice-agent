@@ -137,3 +137,47 @@ def test_clamshell_parse_missing_is_unknown():
     assert ad.parse_clamshell("") is None
     assert ad.parse_clamshell(None) is None
     assert ad.parse_clamshell("nothing relevant here") is None
+
+
+# ------------------------------------------- 入力だけを触ることの保証（回帰防止）
+#
+# 2026-09-09: 案C の初版は sd.default.device = (入力index, 既存の出力index) として
+# 出力側を「保存」していた。しかしデバイスの抜き差しで PortAudio の index は
+# 振り直されるので、保存した index が別デバイスを指し得る。
+# 現状 macOS では出力に sounddevice を使わない（TCC 回避）ため無害だったが、
+# 潜在バグなので出力側には触らない形に直した。
+
+class _FakeDefault:
+    def __init__(self, device):
+        self.device = list(device)
+
+
+class _FakeSD:
+    """sd.default.device の要素代入を再現する最小のフェイク。"""
+    def __init__(self, device=(5, 4)):
+        self.default = _FakeDefault(device)
+        self._devices = [
+            {"name": "外部マイク", "max_input_channels": 1, "max_output_channels": 0},
+        ]
+
+    def query_devices(self):
+        return self._devices
+
+
+def test_apply_touches_only_the_input_slot():
+    import shared_audio
+    s = shared_audio.SharedAudioInput.__new__(shared_audio.SharedAudioInput)
+    s.preferred_device = None
+    fake = _FakeSD(device=(5, 4))
+    chosen = {"index": 2, "name": "外部マイク", "tier": ad.TIER_EXTERNAL}
+    shared_audio._set_input_device(fake, chosen["index"])
+    assert fake.default.device[0] == 2      # 入力は変わる
+    assert fake.default.device[1] == 4      # 出力は元のまま
+
+
+def test_setting_the_input_device_survives_a_missing_slot():
+    import shared_audio
+    fake = _FakeSD(device=(None, None))
+    shared_audio._set_input_device(fake, 7)
+    assert fake.default.device[0] == 7
+    assert fake.default.device[1] is None

@@ -337,3 +337,63 @@ tests: `test_jarvis_speech.py` 13件（新規）、`test_jarvis_status.py` 74 �
 `FRAMES=751`（8 秒の無発話タイムアウト長）で `STT=112ms` の後 `GATE` 以降が全て `-`。
 **「音は入ったが言葉として成立しなかった」ターン**を `Capture ✓` と判定してしまう。
 STT が走ったのに GATE 以降が未実行で終わったターンの可視化は未実装。
+
+---
+
+## 変更7: 案C の潜在バグ修正 — 出力スロットに触らない
+
+### 何が問題だったか
+案C の初版は入力デバイスを選ぶ際にこう書いていた:
+```python
+current = sd.default.device
+output = current[1] if isinstance(current, (list, tuple)) else None
+sd.default.device = (chosen["index"], output)
+```
+出力側を「保存」しているつもりだが、**デバイスの抜き差しで PortAudio の index は
+振り直される**。保存した出力 index が別デバイスを指し得る。
+
+macOS では出力に sounddevice を使わない（TCC の kTCCServiceMediaLibrary プロンプト
+回避。`voice_mode._sounddevice_output_allowed()` が Darwin で False）ため
+**現状は無害**だが、潜在バグなので直した。
+
+### 対策
+`_set_input_device(sd, index)` を追加し、**入力スロットだけ**を設定する。
+`sd.default.device[0] = index` の要素代入が可能であることを実測で確認した。
+
+出力は JARVIS の管轄外である。`afplay` にデバイス指定オプションが無く
+（実測: 音量・時間・レートのみ）、システム既定にしか出せない。
+
+tests: `test_audio_devices.py` に回帰防止 2件を追加（17 → 19件）。
+
+---
+
+## 音声出力が途絶えていた件（2026-09-09）— 原因は切り分け手順の副作用
+
+### 経緯
+TTS は mp3 を生成し `PLAYBACK_DURATION` も記録されるのに音が出ない状態が続いた。
+
+原因は**内蔵マイクの digital silence を切り分けるためにジャックから機器を抜いた**こと。
+```
+21:0x  外部マイク / 外部ヘッドフォン がデバイス一覧から消滅
+       既定入力 = MacBook Proのマイク
+       既定出力 = Realtek USB2.0 Audio（DisplayLink ドック）へ移動
+```
+ヘッドセットを挿し直しても **macOS は既定出力を自動で戻さない**
+（入力は `外部マイク` に戻ったのに、出力は戻らなかった）。
+それ以前は一度もジャックを抜いていなかったため、出力は最初からヘッドフォンに
+向いており維持されていた。
+
+さらに手動で `MacBook Proのスピーカー` に切り替えても、
+**DisplayLink ドックが既定を奪い返す**（2 回発生。ディスプレイのスリープ復帰時に
+USB オーディオが再認識されるため）。
+
+### 解決
+既定出力を `外部ヘッドフォン` に設定 → `afplay` で確認 → JARVIS の応答音声も到達。
+
+### 教訓 / 未対応
+- **ジャックを抜く切り分けは出力経路も動かす。** 手順に「出力先も移る」旨を明記すべきだった
+- `jarvis-status` の `Output` チェックはこの状況を正しく警告していた
+  （`Realtek USB2.0 Audio — 機器が接続されていないと無音になります`）
+- **恒久対策は未実装。** ドックが既定を奪い返す問題は残っている。
+  `afplay` にデバイス指定が無く `osascript` でもデバイスは変えられないため、
+  出力側の優先順位付けには `switchaudio-osx` 等の外部ツールが必要。導入は未承認。
