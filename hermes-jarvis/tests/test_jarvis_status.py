@@ -733,3 +733,67 @@ def test_turn_check_tolerates_a_malformed_timeline():
     chk = c.evaluate_turn(["2026-09-09 12:00:00 INFO jarvis: timeline garbage"])
     assert chk.status in (c.OK, c.WARN)
     assert isinstance(chk.data, dict)
+
+
+# ------------------------------------------------------------------- power
+#
+# CLAMSHELL_SPECIFIC_RECOVERY は handoff §15 で UNVERIFIED とされているが、
+# 2026-09-09 の実測でこの機体では**到達しない**ことが分かった:
+#   Total Sleep/Wakes since boot: 0
+#   AC Power: sleep 0 / displaysleep 0
+#   Amphetamine が PreventUserIdleSystemSleep を 21h40m 保持
+# クラムシェル + AC 常時稼働なのでスリープが発生しない。
+#
+# この前提は不可視だった。可視化しておかないと、次に検証しようとした人が
+# 「なぜ再現しないのか」を調べ直すことになる。
+# 健全性の問題ではないので FAIL は出さない。文脈として出す。
+
+def test_power_reports_that_sleep_is_disabled():
+    chk = c.evaluate_power(sleep_enabled=False, sleeps_since_boot=0,
+                           blockers=["Amphetamine"])
+    assert chk.status == c.OK
+    assert "スリープ" in chk.detail
+    assert chk.data["sleep_enabled"] is False
+
+
+def test_power_names_the_process_holding_the_assertion():
+    chk = c.evaluate_power(sleep_enabled=True, sleeps_since_boot=0,
+                           blockers=["Amphetamine", "Brave Browser"])
+    assert "Amphetamine" in chk.detail
+
+
+def test_power_reports_actual_sleep_cycles_when_they_happened():
+    chk = c.evaluate_power(sleep_enabled=True, sleeps_since_boot=3,
+                           blockers=[])
+    assert chk.status == c.OK
+    assert "3" in chk.detail
+
+
+def test_power_without_information_is_not_a_failure():
+    chk = c.evaluate_power(sleep_enabled=None, sleeps_since_boot=None,
+                           blockers=None)
+    assert chk.status == c.OK
+    assert chk.data["available"] is False
+
+
+def test_power_never_fails_because_it_is_context_not_health():
+    for kw in ({"sleep_enabled": False, "sleeps_since_boot": 0, "blockers": []},
+               {"sleep_enabled": True, "sleeps_since_boot": 99,
+                "blockers": ["x"] * 5}):
+        assert c.evaluate_power(**kw).status != c.FAIL
+
+
+def test_power_omits_the_sleep_count_when_it_is_unavailable():
+    """回数は取得しない方針にした（pmset -g log が 2.99s かかる）。
+
+    None を渡しても文脈として成立し、誤った数値を出さないこと。
+    初版は正規表現 `[^:]*` がタイムスタンプのコロンで止まり、
+    `19:38` の 38 を回数として表示していた（実際は 0）。
+    取れない値を無理に出すより、出さない方が正しい。
+    """
+    chk = c.evaluate_power(sleep_enabled=False, sleeps_since_boot=None,
+                           blockers=["Amphetamine"])
+    assert chk.status == c.OK
+    assert "システムスリープ無効" in chk.detail
+    assert "回" not in chk.detail          # 回数に触れない
+    assert "検証不能" in chk.detail

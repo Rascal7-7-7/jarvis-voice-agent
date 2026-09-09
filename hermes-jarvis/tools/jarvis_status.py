@@ -37,7 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from jarvis_status_checks import (  # noqa: E402
     FAIL, HEALTHY, INFO, OK, WARN, Check, current_generation, evaluate_hermes,
     evaluate_login_item, evaluate_ollama, evaluate_permission, evaluate_process,
-    evaluate_capture_health, evaluate_device, evaluate_output, evaluate_turn, evaluate_shared_stream, evaluate_startup_warm, evaluate_state,
+    evaluate_capture_health, evaluate_device, evaluate_output, evaluate_power, evaluate_turn, evaluate_shared_stream, evaluate_startup_warm, evaluate_state,
     evaluate_wake_lease, evaluate_watchdog, extract_counters, load_gaps,
     match_process, overall_status,
 )
@@ -237,6 +237,44 @@ def _pinned_output() -> str | None:
         return None
 
 
+
+def _power_state() -> tuple[bool | None, int | None, list[str] | None]:
+    """スリープ設定と、スリープを抑止しているプロセス名。
+
+    **`pmset -g log` は使わない。** 72,000 行を吐いて 2.99 秒かかり、
+    jarvis-status 全体を 2s -> 4.3s に悪化させた（実測）。診断を速く回すための
+    コマンドが遅くなるのは本末転倒。`custom` と `assertions` は各 0.01 秒。
+
+    スリープ回数は返さない（常に None）。取得手段が `pmset -g log` しかなく、
+    費用に見合わない。初版は正規表現 `[^:]*` がタイムスタンプのコロンで止まり
+    `19:38` の 38 を回数として表示していた（実際は 0）。
+    取れない値を無理に出すより出さない方が正しい。
+    """
+    sleep_enabled = None
+    blockers: list[str] | None = None
+    try:
+        cur = subprocess.run(["/usr/bin/pmset", "-g", "custom"],
+                             capture_output=True, text=True, timeout=6,
+                             check=False).stdout
+        ac = cur.split("AC Power:", 1)[-1] if "AC Power:" in cur else cur
+        m = re.search(r"^\s*sleep\s+(\d+)", ac, re.M)
+        if m:
+            sleep_enabled = int(m.group(1)) != 0
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        a = subprocess.run(["/usr/bin/pmset", "-g", "assertions"],
+                           capture_output=True, text=True, timeout=6,
+                           check=False).stdout
+        found = re.findall(
+            r"pid \d+\(([^)]+)\):[^\n]*PreventUserIdleSystemSleep", a)
+        # powerd の「ディスプレイが点いている間」は常に出るので文脈にならない
+        blockers = [n for n in dict.fromkeys(found) if n != "powerd"]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return sleep_enabled, None, blockers
+
+
 def _watchdog_events(lines: Sequence[str]) -> list[Mapping[str, Any]]:
     events = []
     for line in lines:
@@ -305,6 +343,7 @@ def collect() -> tuple[list[Check], list[dict[str, Any]]]:
     checks.append(evaluate_device(_counters))
     checks.append(evaluate_capture_health(generation))
     checks.append(evaluate_turn(generation))
+    checks.append(evaluate_power(*_power_state()))
     _dev, _muted, _vol = _default_output()
     checks.append(evaluate_output(_dev, _muted, _vol, _pinned_output()))
     checks.append(evaluate_startup_warm(generation))

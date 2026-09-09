@@ -513,3 +513,59 @@ Output  出力デバイス（UID で固定）
 ```
 
 tests: `test_jarvis_status.py` 82 → 88件。
+
+---
+
+## 変更10: Power チェック — CLAMSHELL_RECOVERY の前提を可視化し、優先度を訂正
+
+### 私の推奨が間違っていた
+`CLAMSHELL_SPECIFIC_RECOVERY` を「ユーザーの日常構成そのものだから優先度が高い」
+と判断したが、**逆だった**。クラムシェル + AC 運用は**スリープを能動的に封じている**。
+
+2026-09-09 の実測:
+```
+pmset -g custom  AC Power: sleep 0 / displaysleep 0     ← システムスリープ無効
+pmset -g assertions  Amphetamine: PreventUserIdleSystemSleep 21h40m 保持
+pmset -g log     Total Sleep/Wakes since boot at 2026-09-08 19:38:41 +0900 :0
+                 ← この runtime を起動した再起動以来、スリープ 0 回
+最後の実スリープ  2026-09-07 17:10（9/8 の再起動より前）
+```
+
+したがってこの gap は**現構成では到達しない**。優先度を上げるのではなく下げるべきだった。
+`known_gaps.json` の status を `UNVERIFIED` → `UNREACHABLE_IN_CURRENT_CONFIG` に変更し、
+経緯（低→高→低）と根拠を note に残した。
+
+### 対策: Power チェック
+この前提は不可視だった。可視化しないと、次に検証しようとした人が
+「なぜ再現しないのか」を一から調べ直す。
+
+```
+Power ✓ システムスリープ無効 / 抑止中: Amphetamine, coreaudiod
+        （CLAMSHELL_SPECIFIC_RECOVERY は現構成では検証不能）
+```
+
+**FAIL は出さない。** スリープしないこと自体は異常ではなく、文脈情報である。
+
+### 実装中に自分で入れた欠陥を2つ潰した
+**1. 誤った回数を表示した。** 初版は正規表現 `[^:]*` が**タイムスタンプのコロンで止まり**、
+`Total Sleep/Wakes since boot at 2026-09-08 19:38:41 +0900 :0` の `19:38` から
+`38` を回数として拾って「起動以来のスリープ 38回」と表示した（実際は 0）。
+→ **回数の取得自体をやめた**。取得手段が `pmset -g log` しかなく費用に見合わない。
+取れない値を無理に出すより出さない方が正しい。
+
+**2. jarvis-status を 2s -> 4.34s に悪化させた。**
+`pmset -g log` が 72,000 行を吐いて **2.99 秒**かかる（`custom` と `assertions` は各 0.01 秒）。
+診断を速く回すためのコマンドが遅くなるのは本末転倒。`pmset -g log` を使わない実装に変更し、
+**1.13 秒**（元の 2 秒より速い）になった。
+
+### known_gaps.json の更新
+`REAL_LOGIN_WARM_VALIDATION` を削除（本日 PASS）。4件 → 3件。
+```
+WAKE_WORD_RELIABILITY  = TUNING_PENDING                 （手つかず）
+CLAMSHELL_RECOVERY     = UNREACHABLE_IN_CURRENT_CONFIG  （本日再分類）
+EARLY_TURN_DURING_WARM = UNVERIFIED
+```
+`EARLY_TURN_DURING_WARM` は本日の warm 検証中に窓（readiness 35s + モデルロード）が
+あったが、レイテンシ測定を汚さないため意図的にターンを止めたので未観測のまま。
+
+tests: `test_jarvis_status.py` 88 → 94件。

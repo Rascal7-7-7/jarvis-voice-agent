@@ -270,6 +270,53 @@ def evaluate_shared_stream(counters: Mapping[str, Any] | None) -> Check:
     return Check("Audio", OK, summary, data)
 
 
+# ------------------------------------------------------------------- power
+#
+# CLAMSHELL_SPECIFIC_RECOVERY（handoff §15）は UNVERIFIED とされているが、
+# 2026-09-09 の実測でこの機体では**到達しない**ことが分かった:
+#   Total Sleep/Wakes since boot: 0
+#   AC Power: sleep 0 / displaysleep 0
+#   Amphetamine が PreventUserIdleSystemSleep を 21h40m 保持
+# クラムシェル + AC 常時稼働なのでスリープが発生しない。
+#
+# この前提は不可視だった。可視化しないと、次に検証しようとした人が
+# 「なぜ再現しないのか」を一から調べ直す。健全性の問題ではないので FAIL は出さない。
+
+
+def evaluate_power(sleep_enabled: bool | None,
+                   sleeps_since_boot: int | None,
+                   blockers: Sequence[str] | None) -> Check:
+    """スリープの有効性と実発生回数。**文脈情報であり健全性判定ではない。**
+
+    ここが FAIL を出すことはない。スリープしないこと自体は異常ではなく、
+    「クラムシェル復帰の検証が今はできない」という事実を伝えるだけ。
+    """
+    if sleep_enabled is None and sleeps_since_boot is None:
+        return Check("Power", OK, "情報なし", {"available": False})
+
+    names = list(blockers or ())
+    data = {"available": True, "sleep_enabled": sleep_enabled,
+            "sleeps_since_boot": sleeps_since_boot, "blockers": names}
+
+    parts: list[str] = []
+    if sleep_enabled is False:
+        parts.append("システムスリープ無効")
+    elif sleep_enabled is True:
+        parts.append("システムスリープ有効")
+
+    if sleeps_since_boot is not None:
+        parts.append(f"起動以来のスリープ {sleeps_since_boot}回")
+
+    if names:
+        parts.append("抑止中: " + ", ".join(names[:2]))
+
+    detail = " / ".join(parts)
+    if sleep_enabled is False or (sleeps_since_boot == 0 and names):
+        detail += "（CLAMSHELL_SPECIFIC_RECOVERY は現構成では検証不能）"
+
+    return Check("Power", OK, detail, data)
+
+
 # -------------------------------------------------------------------- turn
 #
 # Capture チェックの穴を塞ぐ（2026-09-09 実測）。
