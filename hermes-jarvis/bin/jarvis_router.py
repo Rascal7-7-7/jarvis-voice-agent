@@ -213,6 +213,23 @@ def _intent_text(text: str) -> str:
     return _PATHLIKE.sub(" ", text)
 
 
+def _secretary_has_intent(text: str) -> bool:
+    """秘書が実際に扱える発話かどうか。決定的で、モデルを使わない。
+
+    UNKNOWN 以外（REFUSED も含む）なら秘書の仕事とみなす。REFUSED を
+    落とすと、除外プロジェクトへの指示が汎用エージェントへ流れ、
+    **境界が説明されなくなる**ので必ず秘書へ届ける。
+
+    判定に失敗したら従来どおり秘書へ送る（fail-safe: 名前を呼んだのに
+    無反応になるより、できることを列挙する方がまだよい）。
+    """
+    try:
+        kind, _ = jarvis_secretary.classify(text)
+    except Exception:
+        return True
+    return kind != jarvis_secretary.INTENT_UNKNOWN
+
+
 def route(utterance: str) -> dict:
     t0 = time.perf_counter()
     text = jarvis_gate.normalize(utterance)
@@ -261,6 +278,22 @@ def route(utterance: str) -> dict:
 
     for lab, pat in _OVERRIDES:
         if pat.search(intent):
+            # 名前を呼ばれただけで秘書に乗っ取らせない（2026-09-10 実測）。
+            #
+            #     transcript='アルフ今日の天気は?'
+            #     route=SECRETARY by=explicit_override
+            #     → 「秘書にできるのは、状況の確認、…」
+            #
+            # 「アルフ」が override を発火させ、発話の中身に関係なく秘書へ
+            # 送っていた。秘書に天気の意図は無いので、できることを列挙して
+            # 終わる。Web 検索は9プロバイダあるのに到達できなかった。
+            #
+            # これは override の**射程を狭める**変更である。SECRETARY は
+            # 依然 LABELS に無く LLM からは選べないので、決定的境界は
+            # 緩まない（むしろ到達条件が厳しくなる）。
+            # gate は router より前に走るので、降りた発話も素通しではない。
+            if lab == "SECRETARY" and not _secretary_has_intent(intent):
+                continue
             if lab == "LOCAL":
                 lab, why = split_local(text, "LOCAL_TOOL")
                 return {"route": lab, "decided_by": "explicit_override",

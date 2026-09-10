@@ -595,3 +595,60 @@ def test_issho_alone_does_not_trigger():
     # 「一緒」は普通の語。区切り記号が続くときだけ呼びかけとみなす
     assert js.matches("一緒に行こう") is False
     assert js.matches("彼と一緒に作業する") is False
+
+
+# ---------------------------------------------------------------------------
+# 名前を呼ばれただけで秘書に乗っ取らせない（2026-09-10 実測のバグ）
+#
+# ログに残った実例:
+#     transcript='アルフ今日の天気は?'
+#     route=SECRETARY by=explicit_override
+#     state=SPEAKING 秘書にできるのは、状況の確認、プロジェクト一覧、…
+#
+# 「アルフ」という語が決定的 override を発火させ、**発話の中身に関係なく**
+# 秘書へ送っていた。秘書に天気の意図は無いので、できることを列挙して終わる。
+# Web 検索プラグインは9種類あるのに、そこへ到達できなかった。
+#
+# 直し方の方向は「override の射程を狭める」であって、広げるのではない。
+# SECRETARY は依然 LABELS に無く、LLM からは選べない。
+# ---------------------------------------------------------------------------
+
+def test_name_alone_does_not_hijack_a_weather_question():
+    import jarvis_router as jr
+    assert jr.route("アルフ今日の天気は?")["route"] != "SECRETARY"
+
+
+def test_name_alone_does_not_hijack_general_questions():
+    import jarvis_router as jr
+    for text in ("アルフ、今日は何日?",
+                 "アルフ、ニュースを教えて",
+                 "アルフ、Pythonのデコレータって何?",
+                 "アルフ、今何時?"):
+        assert jr.route(text)["route"] != "SECRETARY", text
+
+
+def test_secretary_tasks_still_reach_the_secretary():
+    """射程を狭めても、本来の用途は壊さない。"""
+    import jarvis_router as jr
+    for text in ("アルフ、状況を教えて",
+                 "アルフ、プロジェクトの一覧を出して",
+                 "アルフ、レポートを見せて",
+                 "アルフ、対応が必要なものは?",
+                 "秘書、全プロジェクトのテストを走らせて"):
+        assert jr.route(text)["route"] == "SECRETARY", text
+
+
+def test_excluded_project_still_reaches_the_secretary_to_be_refused():
+    """除外プロジェクトへの指示は秘書に届いて**拒否される**必要がある。
+
+    ここで override を降りると、拒否メッセージではなく汎用エージェントの
+    応答になり、境界が説明されなくなる。
+    """
+    import jarvis_router as jr
+    assert jr.route("アルフ、client-a のテストを走らせて")["route"] == "SECRETARY"
+
+
+def test_llm_still_cannot_choose_secretary_after_the_change():
+    """射程を狭めた後も、LLM から SECRETARY は選べないこと。"""
+    import jarvis_router as jr
+    assert "SECRETARY" not in jr.LABELS
