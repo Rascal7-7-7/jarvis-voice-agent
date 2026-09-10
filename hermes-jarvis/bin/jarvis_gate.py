@@ -50,7 +50,9 @@ def _w(token: str) -> str:
 _add("DESTRUCTIVE",
      r"消して", r"消去", r"削除", r"消しといて", r"消しちゃって", r"抹消",
      r"initialize|初期化", r"まっさら", r"全部消",
-     r"(?<![A-Za-z0-9_])delete(?![A-Za-z0-9_])", r"(?<![A-Za-z0-9_])remove(?![A-Za-z0-9_])", r"(?<![A-Za-z0-9_])wipe(?![A-Za-z0-9_])", r"(?<![A-Za-z0-9_])purge(?![A-Za-z0-9_])", r"(?<![A-Za-z0-9_])destroy(?![A-Za-z0-9_])",
+     r"(?<![A-Za-z0-9_])delete(?![A-Za-z0-9_])", r"(?<![A-Za-z0-9_])remove(?![A-Za-z0-9_])",
+     # 実測: 「delete して」-> 「デリーとして」
+     r"デリー[トと]", r"(?<![A-Za-z0-9_])wipe(?![A-Za-z0-9_])", r"(?<![A-Za-z0-9_])purge(?![A-Za-z0-9_])", r"(?<![A-Za-z0-9_])destroy(?![A-Za-z0-9_])",
      r"(?<![A-Za-z0-9_])rm(?![A-Za-z0-9_])", r"(?<![A-Za-z0-9_])rmdir(?![A-Za-z0-9_])", r"(?<![A-Za-z0-9_])unlink(?![A-Za-z0-9_])",
      r"上書き", r"overwrite",
      r"リセット", r"(?<![A-Za-z0-9_])reset(?![A-Za-z0-9_])",
@@ -86,12 +88,22 @@ _add("SECRET_ACCESS",
 # ---- privilege / system mutation -------------------------------------------
 _add("PRIVILEGE",
      r"(?<![A-Za-z0-9_])sudo(?![A-Za-z0-9_])", r"管理者権限", r"root権限", r"権限を(上げ|昇格)",
+     # STT は英単語をカタカナにする。2026-09-10 実測:
+     #   「sudoで再起動して」-> 「スドーで再起動して」-> **gate 素通り**
+     # 素通り分は LOCAL_TOOL（toolsets=file,terminal,clarify）へ届いていた。
+     # 音声で言われた形を受けないと、この gate は音声経路では機能しない。
+     r"スド[ーウゥー]?|スード",
      r"chmod", r"chown", r"パーミッション.*変更",
      r"csrutil", r"sip.*(無効|disable)", r"gatekeeper.*(無効|disable)",
      r"filevault.*(無効|disable)", r"tccutil")
 
 _add("SYSTEM_CHANGE",
      r"(?<![A-Za-z0-9_])(brew|apt|yum|pip|npm|gem|cargo)\s+(install|uninstall|remove|upgrade)(?![A-Za-z0-9_])",
+     # 実測: 「brew install してください」-> 「ブルーインスタルしてください」
+     #       「npm uninstall して」    -> 「npm アンインスタルして」
+     # ツール名まで化けるので、**命令形と組み合わせたときだけ**止める。
+     # 「インストール手順を教えて」のような普通の発話を潰さないため。
+     r"(アン)?インス(トー|タ)ル\s*(して|しといて|してくれ|する)",
      r"インストールして", r"アンインストール",
      r"グローバルに.*入れて", r"システム.*設定.*変更",
      r"launchd|launchctl", r"再起動して.*(mac|システム)", r"シャットダウン")
