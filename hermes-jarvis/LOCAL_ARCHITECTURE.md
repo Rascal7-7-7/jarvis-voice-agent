@@ -176,7 +176,7 @@ Measured over the 100-case dataset: **51 % decided at 0 ms**, 49 % by the model.
 | `tests/route_dataset.py` | NEW — 100 cases |
 | `tests/test_routes.py` | NEW — section 7 |
 | `tests/test_local_fast_quality.py` | NEW — section 8 |
-| `tests/test_regression.py` | NEW — section 14 |
+| `tests/regression.py`（pytest 対象外・単体スクリプト） | NEW — section 14 |
 
 No upstream file was touched. `~/.hermes/config.yaml` was not written — verified
 identical to the pre-alwayson backup in the voice section, and `silence_duration`
