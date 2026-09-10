@@ -132,7 +132,8 @@ _OVERRIDES = (
     # 発明できない。router は dangerous_action_accuracy 0.75 と実測されており、
     # 書き込みに繋がり得る経路をモデル判断に委ねない（DELEGATION_SECURITY.md）。
     # gate はこのループより前に走るので、危険発話はここに到達しない。
-    ("SECRETARY", re.compile(r"(秘書|ひしょ)")),
+    # パターンは jarvis_secretary から借りる（2箇所に持つと片方だけ直る）
+    ("SECRETARY", jarvis_secretary.TRIGGER),
     ("CODEX", re.compile(r"(コーデックス|codex)", re.IGNORECASE)),
     ("CLAUDE", re.compile(r"(クロード|claude)", re.IGNORECASE)),
     ("WEB", re.compile(r"(ウェブで|webで|ネットで|検索して|ググって|クロームで|chromeで)", re.IGNORECASE)),
@@ -269,6 +270,16 @@ def route(utterance: str) -> dict:
             return {"route": lab, "decided_by": "explicit_override",
                     "categories": [], "llm_used": False,
                     "latency": round(time.perf_counter() - t0, 3), "utterance": text}
+
+    # 終了の指示。**対象が許可リストにあるときだけ** OPEN へ流す。
+    # 「終了して」「閉じて」は総称的なので、動詞だけで拾うと
+    # 無関係な発話まで OPEN に来て拒否メッセージを返してしまう。
+    # override より後ろに置くので「秘書、〜」等はそちらが勝つ。
+    if (jarvis_open.looks_like_close(intent)
+            and jarvis_open.resolve_target(intent) is not None):
+        return {"route": "OPEN", "decided_by": "explicit_override",
+                "categories": [], "llm_used": False,
+                "latency": round(time.perf_counter() - t0, 3), "utterance": text}
 
     for lab, pat in _FAST:
         if pat.search(intent):

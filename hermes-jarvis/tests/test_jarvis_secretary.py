@@ -558,3 +558,40 @@ def test_all_without_a_test_verb_is_still_a_list():
 def test_sweep_does_not_shadow_the_brief():
     intent, _ = js.classify("秘書、状況を教えて", projects=_PROJECTS, excluded=[])
     assert intent == js.INTENT_BRIEF
+
+
+# ---------------------------------------------------------------- 呼び名
+#
+# 2026-09-10: 呼び名を「アルフ」に決めた。実測（faster-whisper small / ja）で
+# 「秘書」→「非処」、「ひしょ」→「一緒」と書き起こされ、
+# **音声では一度も当たっていなかった**ことが分かったための変更でもある。
+
+
+def test_the_nickname_triggers_the_secretary():
+    for t in ["アルフ、状況を教えて", "あるふ、状況を教えて",
+              "アルフさん、状況を教えて"]:
+        assert js.matches(t) is True, t
+
+
+def test_the_measured_misrecognitions_of_hisho_are_accepted():
+    # 実測で出た書き起こし。これを受けないと音声で届かない
+    for t in ["非処 状況を教えて", "一緒、状況を教えて"]:
+        assert js.matches(t) is True, t
+
+
+def test_the_old_trigger_still_works():
+    assert js.matches("秘書、状況を教えて") is True
+    assert js.matches("ひしょ、状況を教えて") is True
+
+
+def test_words_containing_arufu_do_not_trigger():
+    # 実測で全部この表記に書き起こされた
+    for t in ["アルファベットで書いてください", "アルファ版をリリースした",
+              "アルフレッドという名前"]:
+        assert js.matches(t) is False, t
+
+
+def test_issho_alone_does_not_trigger():
+    # 「一緒」は普通の語。区切り記号が続くときだけ呼びかけとみなす
+    assert js.matches("一緒に行こう") is False
+    assert js.matches("彼と一緒に作業する") is False

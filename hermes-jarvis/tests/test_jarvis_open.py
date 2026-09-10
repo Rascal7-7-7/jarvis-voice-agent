@@ -46,6 +46,12 @@ class TestResolve(unittest.TestCase):
             self.assertIsNotNone(got, text)
             self.assertEqual(got["key"], key, text)
 
+    def test_every_project_target_maps_to_a_session(self):
+        # 終了はセッションを落とすので、対応表に穴があると閉じられない
+        for tgt in jo.TARGETS:
+            if tgt["kind"] == jo.ACTION_PROJECT:
+                self.assertIn(tgt["value"], jo.PROJECT_SESSIONS, tgt["key"])
+
     def test_unknown_target_is_none(self):
         for t in ["システム設定を開いて", "ノーションを開いて", "何かを開いて"]:
             self.assertIsNone(jo.resolve_target(t), t)
@@ -88,9 +94,10 @@ class TestPlan(unittest.TestCase):
 
 
 class TestTargets(unittest.TestCase):
-    def test_every_target_is_app_or_url(self):
+    def test_every_target_has_a_known_kind(self):
         for tgt in jo.TARGETS:
-            self.assertIn(tgt["kind"], (jo.ACTION_APP, jo.ACTION_URL))
+            self.assertIn(tgt["kind"],
+                          (jo.ACTION_APP, jo.ACTION_URL, jo.ACTION_PROJECT))
             self.assertTrue(tgt["value"])
             if tgt["kind"] == jo.ACTION_URL:
                 self.assertTrue(tgt["value"].startswith("https://"), tgt["key"])
