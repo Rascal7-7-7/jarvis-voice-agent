@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.aivis.engine</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/Rascal/.local/opt/aivis-speech-engine/run</string>
+    <string>--host</string><string>127.0.0.1</string>
+    <string>--port</string><string>10101</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/Rascal/.local/opt/aivis-speech-engine</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <!-- Background は pri 4 に絞られ 6.9倍遅くなる（2026-09-10 実測）。合成が遅れるので Standard -->
+  <key>ProcessType</key><string>Standard</string>
+  <key>StandardOutPath</key><string>/Users/Rascal/.local/var/log/aivis-engine.log</string>
+  <key>StandardErrorPath</key><string>/Users/Rascal/.local/var/log/aivis-engine.err.log</string>
+</dict>
+</plist>

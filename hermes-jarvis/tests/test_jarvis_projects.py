@@ -139,9 +139,27 @@ class TestRouting(unittest.TestCase):
             self.assertTrue(jo.looks_like_close(t), t)
             self.assertIsNone(jo.resolve_target(t), t)
 
-    def test_the_secretary_still_wins(self):
+    def test_the_name_does_not_win_when_the_secretary_cannot_help(self):
+        """2026-09-11 に挙動を変えた。旧テストは「秘書が勝つ」を固定していた。
+
+        変更の理由は実測である。「秘書、アップを終了して」は秘書の
+        classify が **UNKNOWN** を返す（秘書に終了の意図は無い）。旧挙動では
+        SECRETARY へ行き「できるのは状況の確認、一覧、…」と列挙するだけで、
+        **何も終了しなかった**。一方 OPEN は looks_like_close=True かつ
+        resolve_target が app プロジェクトを解決するので、実際に終了できる。
+
+        名前を呼ばれただけで乗っ取らせない変更（c42106c）の副産物として、
+        この行き止まりが直った。安全性は下がっていない——OPEN は
+        **許可リストで解決できる対象があるときだけ**発火する。
+        """
         self.assertEqual(self.r.route("秘書、アップを終了して")["route"],
-                         "SECRETARY")
+                         "OPEN")
+
+    def test_the_secretary_still_wins_for_its_own_tasks(self):
+        """秘書が扱える発話なら、名前付きで今も秘書が勝つこと。"""
+        for t in ("秘書、状況を教えて", "アルフ、レポートを見せて",
+                  "秘書、全プロジェクトのテストを走らせて"):
+            self.assertEqual(self.r.route(t)["route"], "SECRETARY", t)
 
     def test_reboot_still_does_not_reach_open(self):
         pat = dict(self.r._OVERRIDES)["OPEN"]

@@ -1,0 +1,44 @@
+#!/bin/bash
+# aivis-tts — AivisSpeech Engine で合成する hermes の command プロバイダ。
+#
+# なぜ必要か（2026-09-11）:
+#   それまで JARVIS の応答は edge（ja-JP-NanamiNeural）、秘書の定時ブリーフは
+#   `say -v Kyoko` で、**同じアルフが2つの声で喋っていた**。
+#   さらに edge はテキストを Microsoft へ送るため、ブリーフに含まれる
+#   プロジェクト名・失敗件数が外に出ていた。
+#   AivisSpeech はローカル完結なので、声の統一と送信の排除を同時に解決する。
+#
+# 使い方（hermes の command プロバイダ規約）:
+#   aivis-tts <入力テキストファイル> <出力wavファイル>
+#
+# 話者は SECRETARY_AIVIS_STYLE で差し替えられる。既定は らせつん「標準」。
+#   893625024 標準 / 893625030 標準２ / 893625025 喜び …
+set -uo pipefail
+
+ENDPOINT="${AIVIS_ENDPOINT:-http://127.0.0.1:10101}"
+STYLE="${AIVIS_STYLE:-893625024}"
+IN="${1:-}"
+OUT="${2:-}"
+[ -n "$IN" ] && [ -n "$OUT" ] || { echo "usage: aivis-tts <in.txt> <out.wav>" >&2; exit 64; }
+[ -f "$IN" ] || { echo "aivis-tts: 入力が読めません: $IN" >&2; exit 66; }
+
+TEXT="$(cat "$IN")"
+[ -n "$TEXT" ] || { echo "aivis-tts: 入力が空です" >&2; exit 65; }
+
+TMP="$(mktemp -t aivis-query)"
+trap 'rm -f "$TMP"' EXIT
+
+# audio_query → synthesis の2段。VOICEVOX 互換 API。
+if ! curl -sf --max-time 60 -X POST "${ENDPOINT}/audio_query?speaker=${STYLE}" \
+      --get --data-urlencode "text=${TEXT}" -o "$TMP"; then
+  echo "aivis-tts: audio_query に失敗（エンジンが起動していない可能性）: ${ENDPOINT}" >&2
+  exit 69
+fi
+if ! curl -sf --max-time 120 -X POST "${ENDPOINT}/synthesis?speaker=${STYLE}" \
+      -H "Content-Type: application/json" --data-binary @"$TMP" -o "$OUT"; then
+  echo "aivis-tts: synthesis に失敗" >&2
+  exit 70
+fi
+# 空ファイルを「成功」と言わない
+[ -s "$OUT" ] || { echo "aivis-tts: 出力が空です" >&2; exit 71; }
+exit 0
