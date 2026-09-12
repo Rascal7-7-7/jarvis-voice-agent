@@ -1,5 +1,14 @@
 # 上流 pin と、git 管理外に置いた凍結対象
 
+## 公開リポジトリでの扱い（2026-09-12）
+
+`deploy/pinned-upstream/` に置いていた上流 hermes-agent のコピー2ファイル
+（`tools/voice_mode.py` / `tools/wake_word.py`）は、**この公開リポジトリには含めていない**。
+
+理由: 上流のライセンス表記を確認できなかったため。素性の分からない第三者の
+コードを再配布しない。参照している箇所の説明は本ファイルに残してあるので、
+どこに依存しているかは追える。
+
 ## src/hermes-agent-v2026.8.27（git 管理外）
 
 `hermes-jarvis/src/hermes-agent-v2026.8.27/` は上流 hermes-agent の pin 済みコピー。
