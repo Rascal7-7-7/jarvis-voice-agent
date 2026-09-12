@@ -281,11 +281,32 @@ def test_the_refusal_says_why():
     assert "対象外" in reply
 
 
-def test_excluded_list_is_read_from_the_file_by_default():
-    names = js.excluded_projects()
+def test_excluded_list_is_read_from_the_file_by_default(tmp_path):
+    """除外リストは記憶ではなくファイルから読む。
+
+    既定の読み取り先は開発機にしか無い設定ファイルなので、CI では同じ形式の
+    一時ファイルを渡して「ファイルを読む」ことそのものを検証する。
+    既定パスに依存させると、実行環境で結果が変わるテストになる。
+    """
+    exclude_file = tmp_path / "excluded.txt"
+    exclude_file.write_text(
+        "# 業務プロジェクトは秘書に触らせない\n"
+        "client-a\n"
+        "\n"
+        "   # 空行とコメントは無視される\n",
+        encoding="utf-8",
+    )
+
+    names = js.excluded_projects(str(exclude_file))
+
     assert "client-a" in names
     # コメント行や空行を拾っていないこと
     assert all(n and not n.startswith("#") for n in names)
+
+
+def test_excluded_list_is_empty_when_the_file_is_missing(tmp_path):
+    """ファイルが無い環境でも例外にせず空で返す。"""
+    assert js.excluded_projects(str(tmp_path / "does-not-exist.txt")) == []
 
 
 # ---------------------------------------------------------------- 横断検索
@@ -638,13 +659,19 @@ def test_secretary_tasks_still_reach_the_secretary():
         assert jr.route(text)["route"] == "SECRETARY", text
 
 
-def test_excluded_project_still_reaches_the_secretary_to_be_refused():
+def test_excluded_project_still_reaches_the_secretary_to_be_refused(monkeypatch):
     """除外プロジェクトへの指示は秘書に届いて**拒否される**必要がある。
 
     ここで override を降りると、拒否メッセージではなく汎用エージェントの
     応答になり、境界が説明されなくなる。
     """
     import jarvis_router as jr
+
+    # 既定では ~/work の実体からプロジェクト名を取るため、開発機でしか通らない。
+    # CI でも成立するよう、判定に使う一覧を明示的に差し替える。
+    monkeypatch.setattr(js, "known_projects", lambda *a, **k: ["client-a", "it-study"])
+    monkeypatch.setattr(js, "excluded_projects", lambda *a, **k: ["client-a"])
+
     assert jr.route("アルフ、client-a のテストを走らせて")["route"] == "SECRETARY"
 
 
